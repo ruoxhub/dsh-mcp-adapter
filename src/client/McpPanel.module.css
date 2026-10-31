@@ -1,0 +1,237 @@
+/*
+ * Every colour, radius and shadow is a --dsw-* token, so the panel follows the theme instead of
+ * carrying its own palette. Class names are local to this module: lightningcss hashes them, so the
+ * names below only have to be unique inside this file.
+ */
+
+.root {
+  position: relative;
+}
+
+.trigger {
+  min-height: 28px;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+  background: 0 0;
+  border: 0;
+  border-radius: 6px;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  font-size: 12px;
+  display: inline-flex;
+}
+
+.trigger:hover,
+.trigger:focus-visible {
+  color: var(--dsw-alias-label-primary);
+}
+
+@container (width<=480px) {
+  .triggerLabel {
+    display: none;
+  }
+}
+
+.count {
+  color: var(--dsw-alias-label-caption);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+}
+
+.panel {
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
+  z-index: 100;
+  box-sizing: border-box;
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);
+  width: min(560px, 100vw - 32px);
+  max-height: min(680px, 100vh - 32px);
+  box-shadow: var(--dsw-elevation-prominent);
+  border: 0;
+  border-radius: 12px;
+  flex-direction: column;
+  padding: 8px 2px 0;
+  display: flex;
+  position: fixed;
+  overflow: hidden;
+}
+
+.panel:before {
+  content: "";
+  z-index: -1;
+  background: var(--dsw-specific-menu);
+  backdrop-filter: var(--dsw-menu-backdrop-filter);
+  border-radius: 12px;
+  position: absolute;
+  inset: 0;
+}
+
+.body {
+  --dsh-scrollbar-track-margin: 8px;
+  scrollbar-gutter: stable;
+  flex: auto;
+  min-height: 0;
+  padding: 0 9px 16px 14px;
+  overflow-y: auto;
+}
+
+.panel h3 {
+  color: var(--dsw-alias-label-primary);
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 8px 4px;
+  font-size: 13px;
+  font-weight: 500;
+  display: flex;
+}
+
+.panel h3:first-child {
+  margin-top: 8px;
+}
+
+.rootPath {
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--dsw-font-family-mono, monospace);
+  font-size: 11px;
+  margin: 0 0 8px 4px;
+  overflow-wrap: anywhere;
+}
+
+.rows {
+  flex-direction: column;
+  gap: 8px;
+  display: flex;
+}
+
+.row {
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l2);
+  min-width: 0;
+  box-shadow: var(--dsw-elevation-stroke);
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.rowHead {
+  align-items: center;
+  gap: 8px;
+  display: flex;
+}
+
+.memberDot {
+  flex: none;
+  align-items: center;
+  height: 1lh;
+  display: inline-flex;
+}
+
+.name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+
+.meta {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+  display: flex;
+}
+
+.error {
+  color: var(--dsw-alias-label-primary);
+  font-size: 11px;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+
+.notice {
+  color: var(--dsw-alias-label-tertiary);
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 18px;
+  display: flex;
+}
+
+.emptyNotice {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  margin: 0 0 0 4px;
+}
+
+.actions {
+  flex: none;
+  gap: 4px;
+  display: inline-flex;
+}
+
+.action {
+  min-height: 24px;
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+  background: 0 0;
+  border: 0;
+  border-radius: 6px;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  display: inline-flex;
+}
+
+.action:hover,
+.action:focus-visible {
+  background: var(--dsw-alias-bg-layer-3);
+}
+
+.actionPrimary {
+  color: var(--dsw-alias-state-business-primary);
+}
+
+.toggle {
+  min-width: 0;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+  background: 0 0;
+  border: 0;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 0;
+  font-size: 11px;
+  display: inline-flex;
+}
+
+.toggle:hover,
+.toggle:focus-visible {
+  color: var(--dsw-alias-label-primary);
+}
+
+.toggleOpen {
+  transform: rotate(180deg);
+}
+
+.tools {
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--dsw-font-family-mono, monospace);
+  font-size: 11px;
+  flex-direction: column;
+  gap: 2px;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  list-style: none;
+  overflow-wrap: anywhere;
+}

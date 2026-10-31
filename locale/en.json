@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-mcp-adapter",
+    "description": "Project-level MCP for DeepSeek Harness: discovers MCP servers from the project's .mcp.json and .dsh/mcp-adapter.json plus the global mcp-adapter/mcp.json, starts them lazily and stops them when idle, reaches their tools through one cached-catalog `mcp` proxy tool, and holds project servers until the MCP panel in the conversation header approves them."
+  }
+}

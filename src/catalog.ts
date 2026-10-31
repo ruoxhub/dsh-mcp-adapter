@@ -1,0 +1,199 @@
+// The tool catalog as the model sees it: prefixed names, filters, search ranking, and the compact
+// parameter summaries that keep `mcp({ search })` cheap.
+
+import { prefixedToolName } from './util.ts'
+import type { AdapterSettings } from './config.ts'
+import type { Catalog, CatalogTool, SearchItem, SearchPage, ServerCatalog, ServerConfig } from './types.ts'
+
+/**
+ * Anything object-shaped, arrays included. The source's own checks are `typeof x === 'object'` plus
+ * a null test, so an array-shaped schema field is read the way it read it: as an object.
+ */
+function isObjectLike(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/**
+ * One server's catalog as `buildCatalog` receives it: the config to read filters off, and the raw
+ * catalog when the server has one. A pool entry without a catalog is a server never warmed yet.
+ */
+export interface BuildCatalogEntry {
+  config: ServerConfig
+  catalog?: ServerCatalog
+}
+
+/** Server name -> its tools, after include/exclude filters and name prefixing. */
+export function buildCatalog(servers: Map<string, BuildCatalogEntry>, settings: Partial<AdapterSettings> = {}): Catalog {
+  const tools = new Map<string, CatalogTool>()
+  const resources: Catalog['resources'] = new Map()
+  const prompts: Catalog['prompts'] = new Map()
+  for (const [serverName, entry] of servers) {
+    const config = entry.config
+    const prefix = typeof config.toolPrefix === 'string' ? config.toolPrefix : typeof settings.toolPrefix === 'string' ? settings.toolPrefix : ''
+    for (const tool of entry.catalog?.tools ?? []) {
+      if (config.includeTools && !matchesAny(tool.name, config.includeTools)) continue
+      if (config.excludeTools && matchesAny(tool.name, config.excludeTools)) continue
+      const name = prefixedToolName(serverName, tool.name, prefix)
+      tools.set(name, {
+        name,
+        server: serverName,
+        originalName: tool.name,
+        description: tool.description ?? '',
+        inputSchema: tool.inputSchema,
+        outputSchema: tool.outputSchema,
+        annotations: tool.annotations,
+        keywords: keywordsFor(config.searchKeywords, tool.name, name),
+      })
+    }
+    if (config.exposeResources !== false && settings.exposeResources !== false) {
+      for (const resource of entry.catalog?.resources ?? []) {
+        const name = prefixedToolName(serverName, resource.name || 'resource', prefix)
+        resources.set(name, { name, server: serverName, uri: resource.uri, description: resource.description ?? '', mimeType: resource.mimeType })
+      }
+    }
+    for (const prompt of entry.catalog?.prompts ?? []) {
+      prompts.set(`${serverName}:${prompt.name}`, { server: serverName, ...prompt })
+    }
+  }
+  return { tools, resources, prompts }
+}
+
+/** Include/exclude globs: `*` matches any run of characters, anything else must match exactly. */
+function matchesAny(name: string, patterns: string[]): boolean {
+  return patterns.some((pattern) => (pattern.includes('*') ? new RegExp(`^${pattern.split('*').map(escapeRegExp).join('.*')}$`).test(name) : pattern === name))
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** Per-server `searchKeywords`: exact name, prefixed name, or `*` for every tool. */
+function keywordsFor(configured: unknown, originalName: string, name: string): string[] {
+  if (!isObjectLike(configured)) return []
+  const out: string[] = []
+  for (const [key, value] of Object.entries(configured)) {
+    if (key !== '*' && key !== originalName && key !== name) continue
+    if (Array.isArray(value)) out.push(...value.map(String))
+  }
+  return out
+}
+
+export interface SearchOptions {
+  limit?: number
+  offset?: number
+  regex?: boolean
+  includeSchemas?: boolean
+  server?: string
+}
+
+/**
+ * Rank tools for a query. Weighted matches across name, server, description, and keywords, with
+ * an exact-phrase bonus — the same shape as pi-mcp-adapter's lexical search, and it works offline
+ * because it only reads the cached catalog.
+ * @returns `{ items, total, hasMore, nextOffset }` over prefixed tool names.
+ */
+export function searchTools(catalog: Catalog, query: string, { limit = 12, offset = 0, regex = false, includeSchemas = true, server }: SearchOptions = {}): SearchPage {
+  const candidates = [...catalog.tools.values()].filter((tool) => server === undefined || tool.server === server)
+  let scored: Array<{ tool: CatalogTool; score: number }>
+  if (regex && query) {
+    let pattern: RegExp
+    try {
+      pattern = new RegExp(query, 'i')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return { items: [], total: 0, hasMore: false, nextOffset: null, error: `invalid regex: ${message}` }
+    }
+    scored = candidates.filter((tool) => pattern.test(tool.name) || pattern.test(tool.description)).map((tool) => ({ tool, score: 1 }))
+  } else {
+    const terms = String(query ?? '').toLowerCase().split(/\s+/).filter(Boolean)
+    if (terms.length === 0) {
+      scored = candidates.map((tool) => ({ tool, score: 1 }))
+    } else {
+      // `query` may be any string, including one that is only whitespace: that is the empty search.
+      scored = []
+      for (const tool of candidates) {
+        const name = tool.name.toLowerCase()
+        const toolServer = tool.server.toLowerCase()
+        const description = tool.description.toLowerCase()
+        const keywords = tool.keywords.map((keyword) => keyword.toLowerCase())
+        let score = 0
+        let matchedAll = true
+        for (const term of terms) {
+          let termScore = 0
+          if (name === term || tool.originalName.toLowerCase() === term) termScore += 100
+          if (name.includes(term)) termScore += 40
+          // Hyphens and underscores are interchangeable, as in pi-mcp-adapter's fuzzy naming.
+          if (name.replace(/[-_]/g, '').includes(term.replace(/[-_]/g, ''))) termScore += 20
+          if (keywords.some((keyword) => keyword === term)) termScore += 30
+          if (keywords.some((keyword) => keyword.includes(term))) termScore += 10
+          if (description.includes(term)) termScore += 5
+          if (toolServer.includes(term)) termScore += 2
+          if (termScore === 0) matchedAll = false
+          score += termScore
+        }
+        if (matchedAll && score > 0) scored.push({ tool, score })
+      }
+      scored.sort((left, right) => right.score - left.score || left.tool.name.localeCompare(right.tool.name))
+    }
+  }
+
+  const total = scored.length
+  const page = scored.slice(offset, offset + limit)
+  const items: SearchItem[] = page.map(({ tool }) => ({
+    name: tool.name,
+    server: tool.server,
+    description: tool.description,
+    ...(includeSchemas ? { parameters: summarizeParameters(tool.inputSchema) } : {}),
+    ...(tool.annotations ? { annotations: tool.annotations } : {}),
+  }))
+  return { items, total, hasMore: offset + page.length < total, nextOffset: offset + page.length < total ? offset + page.length : null }
+}
+
+/** A one-line parameter summary: `query, limit?` — required first, nested detail left to describe. */
+export function summarizeParameters(schema: unknown): string | null {
+  if (!isObjectLike(schema) || schema.type !== 'object' || !isObjectLike(schema.properties)) return null
+  const required = new Set(Array.isArray(schema.required) ? schema.required : [])
+  const names = Object.keys(schema.properties)
+  const ordered = [...names.filter((name) => required.has(name)), ...names.filter((name) => !required.has(name))]
+  return ordered.map((name) => (required.has(name) ? name : `${name}?`)).join(', ')
+}
+
+/** Render one search page the way the proxy tool returns it. */
+export function formatSearchPage(page: SearchPage, query: string): string {
+  if (page.error) return page.error
+  if (page.total === 0) return `No MCP tools match "${query}".`
+  const lines = [`MCP tools matching "${query}" (${page.total} total, showing ${page.items.length}):`, '']
+  for (const item of page.items) {
+    const params = item.parameters ? `(${item.parameters})` : ''
+    lines.push(`${item.name}${params} [${item.server}] — ${item.description || '(no description)'}`)
+  }
+  if (page.hasMore) lines.push('', `More results: mcp({ search: ${JSON.stringify(query)}, offset: ${page.nextOffset} })`)
+  lines.push('', 'Call one with mcp({ tool: "<name>", args: { ... } }).')
+  return lines.join('\n')
+}
+
+/** The full description of one tool, including its JSON Schema. */
+export function describeTool(catalog: Catalog, name: string, { includeSchema = true }: { includeSchema?: boolean } = {}): string {
+  const tool = catalog.tools.get(name) ?? [...catalog.tools.values()].find((candidate) => candidate.originalName === name)
+  if (tool === undefined) {
+    const suggestions = [...catalog.tools.keys()].filter((candidate) => candidate.includes(name) || name.includes(candidate)).slice(0, 5)
+    return suggestions.length > 0
+      ? `No MCP tool named "${name}". Did you mean: ${suggestions.join(', ')}?`
+      : `No MCP tool named "${name}".`
+  }
+  const lines = [`${tool.name} [${tool.server}]`, tool.description || '(no description)']
+  const hints = describeAnnotations(tool.annotations)
+  if (hints) lines.push(`Hints: ${hints}`)
+  if (includeSchema && tool.inputSchema) lines.push('', 'Parameters (JSON Schema):', JSON.stringify(tool.inputSchema, null, 2))
+  return lines.join('\n')
+}
+
+function describeAnnotations(annotations: CatalogTool['annotations']): string {
+  if (!annotations) return ''
+  const hints: string[] = []
+  if (annotations.readOnlyHint === true) hints.push('read-only')
+  if (annotations.destructiveHint === true) hints.push('destructive')
+  if (annotations.idempotentHint === true) hints.push('idempotent')
+  if (annotations.openWorldHint === true) hints.push('open-world')
+  return hints.join(', ')
+}

@@ -1,0 +1,10 @@
+node_modules/
+lib/
+*.tgz
+*.tsbuildinfo
+.runtime/
+.worktrees/
+.env
+.env.*
+!.env.example
+.credentials.yaml

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-mcp-adapter",
+    "description": "项目级 MCP：从项目根的 .mcp.json 与 .dsh/mcp-adapter.json、以及全局 mcp-adapter/mcp.json 发现 MCP 服务器，懒启动、空闲即停，工具经一个 mcp 代理工具按目录缓存调用，项目服务器需先在会话页头的 MCP 面板批准。"
+  }
+}

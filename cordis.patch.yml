@@ -1,0 +1,23 @@
+- insert:
+    - id: mcp-adapter
+      name: ./lib/index.js
+      config:
+        enabled: true
+        # Servers come from the project's .mcp.json and $DSH_HOME/mcp-adapter/mcp.json.
+        # ask = a project server waits until its exact definition is approved; allow / deny are absolute.
+        projectServers: ask
+        # Minutes a lazy server may sit idle before it stops again. 0 keeps it for the session.
+        idleTimeout: 10
+        # false (default) = one `mcp` proxy tool in context; true or "search" = first-class tools.
+        directTools: false
+        # Ask before running these MCP tools: true, "destructive", or a list of tool names.
+        # A server's own `autoApprove` list wins for that server (allowlist mode).
+        approveTools: false
+        # Adopt other agents' global MCP files: false, true, or ["claude-code","cursor","vscode","codex"].
+        importHosts: false
+        # Expose MCP resources through the proxy (mcp({ resources }), mcp({ read })).
+        exposeResources: true
+        # Extra config files, highest precedence last. Absolute, or relative to the session directory.
+        configFiles: []
+        # Inline servers, same shape as a `.mcp.json` `mcpServers` entry, highest precedence.
+        servers: {}

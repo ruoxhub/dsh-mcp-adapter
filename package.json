@@ -1,6 +1,6 @@
 {
   "name": "dsh-mcp-adapter",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "pi-mcp-adapter's behavior for DeepSeek Harness, written natively: project-level MCP config, lazy servers that stop when idle, one mcp proxy tool over a cached catalog, direct tools, and a project-server trust gate.",
@@ -33,6 +33,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -56,7 +59,7 @@
     "zod": "4.4.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-session": "0.2.1-rc.2"
+    "@deepseek-ai/dsh-session": ">=0.2.1-rc.2 <0.3.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-session": {

@@ -129,37 +129,9 @@ export function apply(ctx: Context, rawConfig?: Record<string, unknown>): void {
   const settings = sanitizeConfig(rawConfig)
   if (!settings.enabled) return
 
-  // The panel's workspace list is the DSH workspace registry, read the same way skill-manager
-  // does: non-strict, because a headless composition has no registry and must still mount.
-  const registry = ctx.get('workspaceRegistry', false) as WorkspaceRegistrySurface | undefined
-  const service = new McpServersService({
-    dshHome: settings.dshHome,
-    workspaces: () => listRegisteredWorkspaces(registry),
-  })
-  // `ctx.webServer` is declared in `inject`, so it is safe to read; `ctx.router` is NOT a DSH
-  // service at all, and reading an undeclared property on the Cordis proxy throws instead of
-  // returning undefined. Every optional service is therefore reached through `ctx.get(name, false)`.
-  const webServer = ctx.get('webServer', false)
-  if (webServer?.register) {
-    const webRoutes = createMcpWebRoutes(service)
-    if (typeof ctx.effect === 'function') {
-      ctx.effect(() => {
-        const disposers = webRoutes.map((r) => webServer.register(r))
-        return () => { disposers.forEach((d) => typeof d === 'function' && d()) }
-      }, 'mcp-adapter:web-routes')
-    } else {
-      webRoutes.forEach((r) => webServer.register(r))
-    }
-  }
-  // DSH has no `router` service; the REST surface is served by the `webServer` routes above.
-  // `ctx.get('router', false)` never throws, so an absent service simply skips this branch.
-  const router = ctx.get('router', false)
-  if (router?.get && router?.post) {
-    createMcpRouter(router, service)
-  }
-
   /** agent -> McpSession */
   const sessions = new WeakMap<Agent, McpSession>()
+  const activeAgents = new Set<Agent>()
   const rearmTimers = new WeakMap<Agent, ReturnType<typeof setTimeout>>()
   // `ctx.get(name)` defaults to required and throws when the service is absent. Both of these
   // are optional in some compositions, so both are read with `required = false`.
@@ -184,7 +156,51 @@ export function apply(ctx: Context, rawConfig?: Record<string, unknown>): void {
     )
   }
 
+  // The panel's workspace list is the DSH workspace registry, read the same way skill-manager
+  // does: non-strict, because a headless composition has no registry and must still mount.
+  const registry = ctx.get('workspaceRegistry', false) as WorkspaceRegistrySurface | undefined
+  const service = new McpServersService({
+    dshHome: settings.dshHome,
+    workspaces: () => listRegisteredWorkspaces(registry),
+    onEvictServer: async (name: string) => {
+      for (const agent of activeAgents) {
+        const session = sessions.get(agent)
+        if (session) {
+          try {
+            await session.pool.remove(name)
+          } catch {
+            // ignore removal errors
+          }
+          session.catalogStale = true
+          await publish(agent)
+        }
+      }
+    },
+  })
+  // `ctx.webServer` is declared in `inject`, so it is safe to read; `ctx.router` is NOT a DSH
+  // service at all, and reading an undeclared property on the Cordis proxy throws instead of
+  // returning undefined. Every optional service is therefore reached through `ctx.get(name, false)`.
+  const webServer = ctx.get('webServer', false)
+  if (webServer?.register) {
+    const webRoutes = createMcpWebRoutes(service)
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(() => {
+        const disposers = webRoutes.map((r) => webServer.register(r))
+        return () => { disposers.forEach((d) => typeof d === 'function' && d()) }
+      }, 'mcp-adapter:web-routes')
+    } else {
+      webRoutes.forEach((r) => webServer.register(r))
+    }
+  }
+  // DSH has no `router` service; the REST surface is served by the `webServer` routes above.
+  // `ctx.get('router', false)` never throws, so an absent service simply skips this branch.
+  const router = ctx.get('router', false)
+  if (router?.get && router?.post) {
+    createMcpRouter(router, service)
+  }
+
   async function arm(agent: Agent): Promise<McpSession> {
+    activeAgents.add(agent)
     const existing = sessions.get(agent)
     if (existing !== undefined) return existing
     const session = new McpSession({
@@ -268,6 +284,7 @@ export function apply(ctx: Context, rawConfig?: Record<string, unknown>): void {
   }
 
   ctx.on('agent/disposed', async ({ agent }) => {
+    activeAgents.delete(agent)
     const session = sessions.get(agent)
     if (session === undefined) return
     sessions.delete(agent)

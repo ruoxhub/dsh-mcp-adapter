@@ -13,7 +13,8 @@ import {
   SERVER_NAME_PATTERN,
 } from './config.ts'
 import { getKnownPreset, type KnownServerPreset, listKnownPresets } from './presets.ts'
-import { approvalsPath, approve, isApproved } from './trust.ts'
+import { cachePath, purgeCacheEntry } from './cache.ts'
+import { approvalsPath, approve, isApproved, removeApproval } from './trust.ts'
 import type { McpServerDetail, ProbeResult, Scope } from './types.ts'
 
 export type { KnownServerPreset, McpServerDetail, ProbeResult, Scope }
@@ -146,6 +147,9 @@ function toServerDetail(
   }
 
   const rawUrl = raw.url ?? raw.serverUrl ?? raw.httpUrl
+  const headers = isRecord(raw.headers)
+    ? Object.fromEntries(Object.entries(raw.headers).map(([k, v]) => [k, String(v)]))
+    : undefined
   const command = Array.isArray(raw.command)
     ? String(raw.command[0])
     : typeof raw.command === 'string'
@@ -170,6 +174,7 @@ function toServerDetail(
     ...(command !== undefined ? { command } : {}),
     ...(args !== undefined ? { args } : {}),
     ...(rawUrl !== undefined ? { url: String(rawUrl) } : {}),
+    ...(headers !== undefined ? { headers } : {}),
     ...(env !== undefined ? { env } : {}),
     ...(typeof raw.cwd === 'string' ? { cwd: raw.cwd } : {}),
     ...(typeof raw.timeoutMs === 'number'
@@ -196,15 +201,21 @@ export interface McpServersServiceOptions {
    * one still gets the active project root as the only entry.
    */
   workspaces?: () => WorkspaceOption[]
+  /**
+   * Optional eviction hook to close/evict running connections from active pools.
+   */
+  onEvictServer?: (name: string) => Promise<void> | void
 }
 
 export class McpServersService {
   private readonly dshHome: string
   private readonly registeredWorkspaces?: () => WorkspaceOption[]
+  private readonly onEvictServer?: (name: string) => Promise<void> | void
 
   constructor(options?: McpServersServiceOptions) {
     this.dshHome = options?.dshHome ?? resolveDshHome()
     this.registeredWorkspaces = options?.workspaces
+    this.onEvictServer = options?.onEvictServer
   }
 
   /**
@@ -287,6 +298,8 @@ export class McpServersService {
     scope: Scope
     cwd?: string
     name: string
+    originalName?: string
+    originalScope?: Scope
     server: Record<string, unknown>
   }): Promise<{ ok: boolean }> {
     if (!SERVER_NAME_PATTERN.test(options.name)) {
@@ -299,12 +312,63 @@ export class McpServersService {
       ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
       : join(workspaceRoot, '.mcp.json')
 
-    const data = safeReadJson(targetPath) ?? {}
-    if (!isRecord(data.mcpServers)) {
-      data.mcpServers = {}
+    const prevName = options.originalName?.trim() || options.name
+    const prevScope = options.originalScope || options.scope
+    const isRename = prevName !== options.name
+    const isScopeChange = prevScope !== options.scope
+
+    if (isScopeChange) {
+      // 1. Write to target scope
+      const data = safeReadJson(targetPath) ?? {}
+      if (!isRecord(data.mcpServers)) {
+        data.mcpServers = {}
+      }
+      ;(data.mcpServers as Record<string, unknown>)[options.name] = options.server
+      safeWriteJson(targetPath, data)
+
+      // 2. Remove old entry from old scope
+      const oldTargetPath = prevScope === 'user'
+        ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
+        : join(workspaceRoot, '.mcp.json')
+      const oldData = safeReadJson(oldTargetPath)
+      if (oldData) {
+        let changed = false
+        if (isRecord(oldData.mcpServers) && prevName in oldData.mcpServers) {
+          delete (oldData.mcpServers as Record<string, unknown>)[prevName]
+          changed = true
+        }
+        if (isRecord(oldData.servers) && prevName in oldData.servers) {
+          delete (oldData.servers as Record<string, unknown>)[prevName]
+          changed = true
+        }
+        if (changed) {
+          safeWriteJson(oldTargetPath, oldData)
+        }
+      }
+
+      if (prevScope === 'workspace') {
+        removeApproval(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, prevName)
+      }
+    } else {
+      // Same scope
+      const data = safeReadJson(targetPath) ?? {}
+      if (!isRecord(data.mcpServers)) {
+        data.mcpServers = {}
+      }
+      if (isRename) {
+        if (prevName in (data.mcpServers as Record<string, unknown>)) {
+          delete (data.mcpServers as Record<string, unknown>)[prevName]
+        }
+        if (isRecord(data.servers) && prevName in (data.servers as Record<string, unknown>)) {
+          delete (data.servers as Record<string, unknown>)[prevName]
+        }
+        if (options.scope === 'workspace') {
+          removeApproval(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, prevName)
+        }
+      }
+      ;(data.mcpServers as Record<string, unknown>)[options.name] = options.server
+      safeWriteJson(targetPath, data)
     }
-    ;(data.mcpServers as Record<string, unknown>)[options.name] = options.server
-    safeWriteJson(targetPath, data)
 
     // User explicit save of workspace server counts as user trust -> auto-approve
     if (options.scope === 'workspace') {
@@ -316,6 +380,24 @@ export class McpServersService {
       } catch {
         // If entry fails validation, saving succeeds; approval fails gracefully
       }
+    }
+
+    // Evict old identity from cache & pool if renamed or moved
+    if (isRename || isScopeChange) {
+      purgeCacheEntry(cachePath(adapterHome(this.dshHome)), prevName)
+      try {
+        await this.onEvictServer?.(prevName)
+      } catch {
+        // Eviction errors do not fail the save
+      }
+    }
+
+    // Invalidate new server cache & running connection so changes take effect immediately
+    purgeCacheEntry(cachePath(adapterHome(this.dshHome)), options.name)
+    try {
+      await this.onEvictServer?.(options.name)
+    } catch {
+      // Eviction errors do not fail the save
     }
 
     return { ok: true }
@@ -369,6 +451,18 @@ export class McpServersService {
       if (changed) {
         safeWriteJson(targetPath, data)
       }
+    }
+
+    if (options.scope === 'workspace') {
+      removeApproval(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, options.name)
+    }
+
+    // Invalidate disk cache and evict running process from ServerPool
+    purgeCacheEntry(cachePath(adapterHome(this.dshHome)), options.name)
+    try {
+      await this.onEvictServer?.(options.name)
+    } catch {
+      // Eviction errors do not fail the delete
     }
 
     return { ok: true }

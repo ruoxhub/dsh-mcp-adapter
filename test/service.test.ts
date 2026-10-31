@@ -202,6 +202,67 @@ describe('McpServersService', () => {
         }),
       ).rejects.toThrow(/invalid server name/i)
     })
+
+    it('performs atomic rename in the same scope, removing the old server key and evicting pool', async () => {
+      const userConfigPath = join(dshHome, 'mcp-adapter', 'mcp.json')
+      writeFileSync(
+        userConfigPath,
+        JSON.stringify({
+          mcpServers: {
+            'old-server': { command: 'node', args: ['old.js'] },
+            'keep-me': { command: 'node', args: ['keep.js'] },
+          },
+        }),
+      )
+
+      const evictSpy = vi.fn()
+      const service = new McpServersService({ dshHome, onEvictServer: evictSpy })
+      const res = await service.saveServer({
+        scope: 'user',
+        name: 'renamed-server',
+        originalName: 'old-server',
+        server: { command: 'node', args: ['new.js'] },
+      })
+
+      expect(res.ok).toBe(true)
+      const content = JSON.parse(readFileSync(userConfigPath, 'utf8'))
+      expect(content.mcpServers['old-server']).toBeUndefined()
+      expect(content.mcpServers['renamed-server']).toBeDefined()
+      expect(content.mcpServers['keep-me']).toBeDefined()
+      expect(evictSpy).toHaveBeenCalledWith('old-server')
+      expect(evictSpy).toHaveBeenCalledWith('renamed-server')
+    })
+
+    it('migrates a server across scopes, cleaning up the original file and approvals', async () => {
+      const userConfigPath = join(dshHome, 'mcp-adapter', 'mcp.json')
+      const workspaceConfigPath = join(workspaceDir, '.mcp.json')
+      writeFileSync(
+        userConfigPath,
+        JSON.stringify({
+          mcpServers: {
+            'migrating-server': { command: 'node', args: ['tool.js'] },
+          },
+        }),
+      )
+
+      const evictSpy = vi.fn()
+      const service = new McpServersService({ dshHome, onEvictServer: evictSpy })
+      const res = await service.saveServer({
+        scope: 'workspace',
+        cwd: workspaceDir,
+        name: 'migrating-server',
+        originalScope: 'user',
+        server: { command: 'node', args: ['tool.js'] },
+      })
+
+      expect(res.ok).toBe(true)
+      const userContent = JSON.parse(readFileSync(userConfigPath, 'utf8'))
+      expect(userContent.mcpServers['migrating-server']).toBeUndefined()
+
+      const wsContent = JSON.parse(readFileSync(workspaceConfigPath, 'utf8'))
+      expect(wsContent.mcpServers['migrating-server']).toBeDefined()
+      expect(evictSpy).toHaveBeenCalledWith('migrating-server')
+    })
   })
 
   describe('deleteServer', () => {
@@ -217,13 +278,15 @@ describe('McpServersService', () => {
         }),
       )
 
-      const service = new McpServersService({ dshHome })
+      const evictSpy = vi.fn()
+      const service = new McpServersService({ dshHome, onEvictServer: evictSpy })
       const res = await service.deleteServer({ scope: 'user', name: 'remove' })
       expect(res.ok).toBe(true)
 
       const content = JSON.parse(readFileSync(userConfigPath, 'utf8'))
       expect(content.mcpServers.keep).toBeDefined()
       expect(content.mcpServers.remove).toBeUndefined()
+      expect(evictSpy).toHaveBeenCalledWith('remove')
     })
 
     it('returns ok: true when deleting from non-existent config file', async () => {

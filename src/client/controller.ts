@@ -163,7 +163,9 @@ export class McpPanelController {
       command: server.command ?? '',
       args: Array.isArray(server.args) ? formatArgsArray(server.args) : '',
       url: server.url ?? '',
-      headers: [],
+      headers: server.headers
+        ? Object.entries(server.headers).map(([key, value]) => ({ key, value }))
+        : [],
       timeoutMs: server.timeoutMs ?? 30000,
       protocolVersion: server.protocolVersion ?? '',
       env: server.env

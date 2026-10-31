@@ -922,6 +922,12 @@
   cursor: not-allowed;
 }
 
+.cardDeleteButton:hover:not(:disabled) {
+  color: var(--dsw-alias-state-danger-primary, #e5484d);
+  border-color: var(--dsw-alias-state-danger-primary, #e5484d);
+  background: var(--dsw-alias-bg-danger-subtle, rgba(229, 72, 77, 0.08));
+}
+
 .cardApproveButton {
   padding: 3px 8px;
   font-size: 11px;

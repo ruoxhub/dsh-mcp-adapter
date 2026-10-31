@@ -42,7 +42,14 @@ export class McpServersApiClient {
     return this.request<{ servers: McpServerDetail[]; workspaceRoot: string }>(url, { method: 'GET' })
   }
 
-  async saveServer(payload: { scope: string; cwd?: string; name: string; server: Record<string, unknown> }): Promise<{ ok: boolean }> {
+  async saveServer(payload: {
+    scope: string
+    cwd?: string
+    name: string
+    originalName?: string
+    originalScope?: string
+    server: Record<string, unknown>
+  }): Promise<{ ok: boolean }> {
     return this.request<{ ok: boolean }>(API_ROUTES.save, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

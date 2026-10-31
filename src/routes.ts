@@ -113,13 +113,21 @@ export function createMcpWebRoutes(service: McpServersService): McpWebRoute[] {
         }
         try {
           const body = (await readJsonBody(req)) ?? {}
-          const { scope, cwd, name, server } = body
+          const { scope, cwd, name, originalName, originalScope, server } = body
           if (scope !== 'user' && scope !== 'workspace') {
             writeJson(res, 400, { error: 'Field "scope" must be "user" or "workspace"' })
             return
           }
+          if (originalScope !== undefined && originalScope !== 'user' && originalScope !== 'workspace') {
+            writeJson(res, 400, { error: 'Field "originalScope" must be "user" or "workspace"' })
+            return
+          }
           if (!name || typeof name !== 'string' || name.trim().length === 0) {
             writeJson(res, 400, { error: 'Field "name" is required' })
+            return
+          }
+          if (originalName !== undefined && (typeof originalName !== 'string' || originalName.trim().length === 0)) {
+            writeJson(res, 400, { error: 'Field "originalName" must be a non-empty string' })
             return
           }
           if (!isPlainObject(server)) {
@@ -129,6 +137,8 @@ export function createMcpWebRoutes(service: McpServersService): McpWebRoute[] {
           await service.saveServer({
             scope: scope as Scope,
             name: name.trim(),
+            originalName: typeof originalName === 'string' ? originalName.trim() : undefined,
+            originalScope: originalScope as Scope | undefined,
             server,
             cwd: typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined,
           })
@@ -300,15 +310,25 @@ export function createMcpRouter(router: RouterLike, service: McpServersService):
   router.post(ROUTES.save, async (ctx: any) => {
     try {
       const body = ctx.request?.body ?? ctx.body ?? {}
-      const { scope, cwd, name, server } = body
+      const { scope, cwd, name, originalName, originalScope, server } = body
       if (scope !== 'user' && scope !== 'workspace') {
         ctx.status = 400
         ctx.body = { error: 'Field "scope" must be "user" or "workspace"' }
         return
       }
+      if (originalScope !== undefined && originalScope !== 'user' && originalScope !== 'workspace') {
+        ctx.status = 400
+        ctx.body = { error: 'Field "originalScope" must be "user" or "workspace"' }
+        return
+      }
       if (!name || typeof name !== 'string' || name.trim().length === 0) {
         ctx.status = 400
         ctx.body = { error: 'Field "name" is required' }
+        return
+      }
+      if (originalName !== undefined && (typeof originalName !== 'string' || originalName.trim().length === 0)) {
+        ctx.status = 400
+        ctx.body = { error: 'Field "originalName" must be a non-empty string' }
         return
       }
       if (!isPlainObject(server)) {
@@ -319,6 +339,8 @@ export function createMcpRouter(router: RouterLike, service: McpServersService):
       await service.saveServer({
         scope: scope as Scope,
         name: name.trim(),
+        originalName: typeof originalName === 'string' ? originalName.trim() : undefined,
+        originalScope: originalScope as Scope | undefined,
         server,
         cwd: typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined,
       })

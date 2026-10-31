@@ -610,7 +610,8 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
                               <button
                                 type="button"
                                 data-action="delete"
-                                className={css.cardActionButton}
+                                className={`${css.cardActionButton} ${css.cardDeleteButton}`}
+                                title={tt('action.delete')}
                                 onClick={() => handleDelete(server)}
                               >
                                 {tt('action.delete')}

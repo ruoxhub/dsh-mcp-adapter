@@ -183,11 +183,41 @@ describe('Mcp Routes & WebServer Registration', () => {
         expect(service.saveServer).toHaveBeenCalledWith({
           scope: 'user',
           name: 'memory',
+          originalName: undefined,
+          originalScope: undefined,
           cwd: '/path/cwd',
           server: { command: 'node', args: ['server.js'] },
         })
         expect(getStatusCode()).toBe(200)
         expect(getBody()).toEqual({ ok: true })
+      })
+
+      it('forwards originalName and originalScope when provided', async () => {
+        const service = {
+          saveServer: vi.fn().mockResolvedValue({ ok: true }),
+        } as unknown as McpServersService
+        const route = findRoute(createMcpWebRoutes(service), '/api/dsh-mcp-adapter/save')
+
+        const payload = {
+          scope: 'workspace',
+          name: 'renamed',
+          originalName: 'old-name',
+          originalScope: 'user',
+          server: { command: 'node' },
+        }
+        const req = createMockReq({ method: 'POST', url: '/api/dsh-mcp-adapter/save', body: payload })
+        const { res, getStatusCode, getBody } = createMockRes()
+
+        await route.handler(req, res)
+        expect(service.saveServer).toHaveBeenCalledWith({
+          scope: 'workspace',
+          name: 'renamed',
+          originalName: 'old-name',
+          originalScope: 'user',
+          cwd: undefined,
+          server: { command: 'node' },
+        })
+        expect(getStatusCode()).toBe(200)
       })
 
       it('validates required fields (scope, name, server)', async () => {

@@ -103,3 +103,12 @@ export function storeEntry(cache: CatalogCache, name: string, config: ServerConf
 export function forgetEntry(cache: CatalogCache, name: string): void {
   delete cache.servers[name]
 }
+
+/** Purge one server's catalog from the persistent cache file on disk. */
+export function purgeCacheEntry(path: string, name: string): void {
+  const cache = loadCache(path)
+  if (cache.servers && name in cache.servers) {
+    forgetEntry(cache, name)
+    saveCache(path, cache)
+  }
+}

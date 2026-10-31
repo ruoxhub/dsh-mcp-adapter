@@ -34,6 +34,8 @@ export function ServerEditorTab({
   const activeCwd = snapshot.workspacePath ?? cwd
 
   const isEditing = Boolean(snapshot.editingServer)
+  const originalName = snapshot.editingServer?.name
+  const originalScope = snapshot.editingServer?.scope
   const titleText = isEditing ? tt('editor.title_edit') : tt('editor.title_create')
 
   const handleFormChange = (patch: Partial<ServerDraft>): void => {
@@ -200,6 +202,8 @@ export function ServerEditorTab({
         scope: draft.scope,
         cwd: draft.scope === 'workspace' ? activeCwd : undefined,
         name,
+        originalName: isEditing ? originalName : undefined,
+        originalScope: isEditing ? originalScope : undefined,
         server: serverToSave,
       })
       onSaved?.()

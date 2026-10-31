@@ -578,6 +578,8 @@ describe('ServerEditorTab', () => {
       scope: 'workspace',
       cwd: '/workspace',
       name: 'existing-server',
+      originalName: 'existing-server',
+      originalScope: 'workspace',
       server: {
         category: 'database',
         description: 'Persistent SQLite database server',
@@ -587,6 +589,53 @@ describe('ServerEditorTab', () => {
         // Saved under the canonical key the normalizer reads, not the alias it merely tolerates.
         requestTimeoutMs: 45000,
         protocolVersion: '2024-11-05',
+      },
+    })
+  })
+
+  it('submits originalName and originalScope when renaming and switching scope in form mode', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ok: true }),
+    })
+    const api = new McpServersApiClient(mockFetch as unknown as typeof fetch)
+    const controller = new McpPanelController({ scope: 'workspace' })
+
+    act(() => {
+      controller.openEdit({
+        name: 'old-server',
+        scope: 'workspace',
+        category: 'custom',
+        transport: 'stdio',
+        command: 'echo',
+        args: ['hello'],
+        status: 'ready',
+      })
+      controller.updateDraft(() => ({
+        name: 'new-server',
+        scope: 'user',
+        command: 'echo-v2',
+      }))
+    })
+
+    renderComponent(createElement(ServerEditorTab, { controller, api, cwd: '/workspace' }))
+
+    const saveBtn = container?.querySelector('button[data-action="save"]') as HTMLButtonElement
+    await act(async () => {
+      saveBtn.click()
+    })
+
+    const calledBody = JSON.parse(mockFetch.mock.calls[0][1].body)
+    expect(calledBody).toEqual({
+      scope: 'user',
+      cwd: undefined,
+      name: 'new-server',
+      originalName: 'old-server',
+      originalScope: 'workspace',
+      server: {
+        category: 'custom',
+        command: 'echo-v2',
+        args: ['hello'],
       },
     })
   })

@@ -130,6 +130,15 @@ export function approve(path: string, projectRoot: string, serverName: string, c
   return hash
 }
 
+export function removeApproval(path: string, projectRoot: string, serverName: string): void {
+  const store = readStore(path)
+  const initialLen = store.approvals.length
+  store.approvals = store.approvals.filter((record) => !(isRecord(record) && record.projectRoot === projectRoot && record.serverName === serverName))
+  if (store.approvals.length !== initialLen) {
+    writeStore(path, store)
+  }
+}
+
 /**
  * Split the merged server map into what may start and what is held back.
  * @returns `{ mount, blocked }`, where blocked entries carry a reason the model can act on.

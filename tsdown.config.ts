@@ -1,4 +1,8 @@
-import { clientBundle } from '../../shared/tsdown.client.ts'
+import { clientBundle } from './shared/tsdown.client.ts'
+
+// `shared/` is a vendored copy of the dsh-web repository preset, not a workspace reference: this
+// package is published from its own repository, where `../../shared` does not exist. Same rule the
+// other plugin repositories in the family follow.
 
 export default clientBundle('dsh-mcp-adapter', ['src/index.ts'], {
   libExternal: [

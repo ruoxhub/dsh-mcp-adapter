@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { McpServersService } from './service.ts'
-import type { Scope } from './types.ts'
+import type { ExternalMcpCandidate, Scope } from './types.ts'
 
 export const ROUTES = {
   servers: 'api/dsh-mcp-adapter/servers',
@@ -10,6 +10,11 @@ export const ROUTES = {
   probe: 'api/dsh-mcp-adapter/probe',
   presets: 'api/dsh-mcp-adapter/presets',
   installPreset: 'api/dsh-mcp-adapter/presets/install',
+  toggle: 'api/dsh-mcp-adapter/toggle',
+  migrateScope: 'api/dsh-mcp-adapter/migrate-scope',
+  scanExternal: 'api/dsh-mcp-adapter/scan-external',
+  importExternal: 'api/dsh-mcp-adapter/import-external',
+  catalog: 'api/dsh-mcp-adapter/catalog',
 } as const
 
 export interface RouterLike {
@@ -281,6 +286,146 @@ export function createMcpWebRoutes(service: McpServersService): McpWebRoute[] {
         }
       },
     },
+    {
+      kind: 'exact',
+      path: `/${ROUTES.toggle}`,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== 'POST') {
+          res.writeHead(405)
+          res.end('Method Not Allowed')
+          return
+        }
+        try {
+          const body = (await readJsonBody(req)) ?? {}
+          const { name, scope, cwd, enabled } = body
+          if (!name || typeof name !== 'string' || name.trim().length === 0) {
+            writeJson(res, 400, { error: 'Field "name" is required' })
+            return
+          }
+          if (scope !== 'user' && scope !== 'workspace') {
+            writeJson(res, 400, { error: 'Field "scope" must be "user" or "workspace"' })
+            return
+          }
+          if (typeof enabled !== 'boolean') {
+            writeJson(res, 400, { error: 'Field "enabled" must be a boolean' })
+            return
+          }
+          const result = await service.toggleServer({
+            name: name.trim(),
+            scope: scope as Scope,
+            cwd: typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined,
+            enabled,
+          })
+          writeJson(res, 200, result)
+        } catch (err: unknown) {
+          const status = (err as HttpError)?.statusCode ?? 500
+          writeJson(res, status, { error: messageOf(err) || 'Failed to toggle server' })
+        }
+      },
+    },
+    {
+      kind: 'exact',
+      path: `/${ROUTES.migrateScope}`,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== 'POST') {
+          res.writeHead(405)
+          res.end('Method Not Allowed')
+          return
+        }
+        try {
+          const body = (await readJsonBody(req)) ?? {}
+          const { name, fromScope, toScope, cwd } = body
+          if (!name || typeof name !== 'string' || name.trim().length === 0) {
+            writeJson(res, 400, { error: 'Field "name" is required' })
+            return
+          }
+          if ((fromScope !== 'user' && fromScope !== 'workspace') || (toScope !== 'user' && toScope !== 'workspace')) {
+            writeJson(res, 400, { error: 'Fields "fromScope" and "toScope" must be "user" or "workspace"' })
+            return
+          }
+          const result = await service.migrateScope({
+            name: name.trim(),
+            fromScope: fromScope as Scope,
+            toScope: toScope as Scope,
+            cwd: typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined,
+          })
+          writeJson(res, 200, result)
+        } catch (err: unknown) {
+          const status = (err as HttpError)?.statusCode ?? 500
+          writeJson(res, status, { error: messageOf(err) || 'Failed to migrate server scope' })
+        }
+      },
+    },
+    {
+      kind: 'exact',
+      path: `/${ROUTES.scanExternal}`,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== 'GET') {
+          res.writeHead(405)
+          res.end('Method Not Allowed')
+          return
+        }
+        try {
+          const url = new URL(req.url ?? '/', 'http://localhost')
+          const cwd = url.searchParams.get('cwd')?.trim() || undefined
+          const result = service.scanExternal({ cwd })
+          writeJson(res, 200, result)
+        } catch (err: unknown) {
+          const status = (err as HttpError)?.statusCode ?? 500
+          writeJson(res, status, { error: messageOf(err) || 'Failed to scan external MCP configurations' })
+        }
+      },
+    },
+    {
+      kind: 'exact',
+      path: `/${ROUTES.importExternal}`,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== 'POST') {
+          res.writeHead(405)
+          res.end('Method Not Allowed')
+          return
+        }
+        try {
+          const body = (await readJsonBody(req)) ?? {}
+          const { items, scope, cwd } = body
+          if (!Array.isArray(items)) {
+            writeJson(res, 400, { error: 'Field "items" must be an array' })
+            return
+          }
+          if (scope !== 'user' && scope !== 'workspace') {
+            writeJson(res, 400, { error: 'Field "scope" must be "user" or "workspace"' })
+            return
+          }
+          const result = await service.importExternal({
+            items: items as ExternalMcpCandidate[],
+            scope: scope as Scope,
+            cwd: typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined,
+          })
+          writeJson(res, 200, result)
+        } catch (err: unknown) {
+          const status = (err as HttpError)?.statusCode ?? 500
+          writeJson(res, status, { error: messageOf(err) || 'Failed to import external MCP configurations' })
+        }
+      },
+    },
+    {
+      kind: 'exact',
+      path: `/${ROUTES.catalog}`,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== 'GET') {
+          res.writeHead(405)
+          res.end('Method Not Allowed')
+          return
+        }
+        try {
+          const result = service.listCatalog()
+          writeJson(res, 200, { catalog: result })
+        } catch (err: unknown) {
+          const status = (err as HttpError)?.statusCode ?? 500
+          writeJson(res, status, { error: messageOf(err) || 'Failed to list MCP catalog' })
+        }
+      },
+    },
   ]
 }
 
@@ -456,6 +601,123 @@ export function createMcpRouter(router: RouterLike, service: McpServersService):
     } catch (err: unknown) {
       ctx.status = (err as HttpError)?.statusCode ?? 500
       ctx.body = { error: messageOf(err) || 'Failed to install preset' }
+    }
+  })
+
+  // POST api/dsh-mcp-adapter/toggle
+  router.post(ROUTES.toggle, async (ctx: any) => {
+    try {
+      const body = ctx.request?.body ?? ctx.body ?? {}
+      const { name, scope, cwd, enabled } = body
+      if (!name || typeof name !== 'string' || name.trim().length === 0) {
+        ctx.status = 400
+        ctx.body = { error: 'Field "name" is required' }
+        return
+      }
+      if (scope !== 'user' && scope !== 'workspace') {
+        ctx.status = 400
+        ctx.body = { error: 'Field "scope" must be "user" or "workspace"' }
+        return
+      }
+      if (typeof enabled !== 'boolean') {
+        ctx.status = 400
+        ctx.body = { error: 'Field "enabled" must be a boolean' }
+        return
+      }
+      const result = await service.toggleServer({
+        name: name.trim(),
+        scope: scope as Scope,
+        cwd: typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined,
+        enabled,
+      })
+      ctx.status = 200
+      ctx.body = result
+    } catch (err: unknown) {
+      ctx.status = (err as HttpError)?.statusCode ?? 500
+      ctx.body = { error: messageOf(err) || 'Failed to toggle server' }
+    }
+  })
+
+  // POST api/dsh-mcp-adapter/migrate-scope
+  router.post(ROUTES.migrateScope, async (ctx: any) => {
+    try {
+      const body = ctx.request?.body ?? ctx.body ?? {}
+      const { name, fromScope, toScope, cwd } = body
+      if (!name || typeof name !== 'string' || name.trim().length === 0) {
+        ctx.status = 400
+        ctx.body = { error: 'Field "name" is required' }
+        return
+      }
+      if ((fromScope !== 'user' && fromScope !== 'workspace') || (toScope !== 'user' && toScope !== 'workspace')) {
+        ctx.status = 400
+        ctx.body = { error: 'Fields "fromScope" and "toScope" must be "user" or "workspace"' }
+        return
+      }
+      const result = await service.migrateScope({
+        name: name.trim(),
+        fromScope: fromScope as Scope,
+        toScope: toScope as Scope,
+        cwd: typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined,
+      })
+      ctx.status = 200
+      ctx.body = result
+    } catch (err: unknown) {
+      ctx.status = (err as HttpError)?.statusCode ?? 500
+      ctx.body = { error: messageOf(err) || 'Failed to migrate server scope' }
+    }
+  })
+
+  // GET api/dsh-mcp-adapter/scan-external
+  router.get(ROUTES.scanExternal, async (ctx: any) => {
+    try {
+      const query = ctx.query ?? ctx.request?.query ?? {}
+      const cwd = typeof query.cwd === 'string' && query.cwd.trim().length > 0 ? query.cwd.trim() : undefined
+      const result = service.scanExternal({ cwd })
+      ctx.status = 200
+      ctx.body = result
+    } catch (err: unknown) {
+      ctx.status = (err as HttpError)?.statusCode ?? 500
+      ctx.body = { error: messageOf(err) || 'Failed to scan external MCP configurations' }
+    }
+  })
+
+  // POST api/dsh-mcp-adapter/import-external
+  router.post(ROUTES.importExternal, async (ctx: any) => {
+    try {
+      const body = ctx.request?.body ?? ctx.body ?? {}
+      const { items, scope, cwd } = body
+      if (!Array.isArray(items)) {
+        ctx.status = 400
+        ctx.body = { error: 'Field "items" must be an array' }
+        return
+      }
+      if (scope !== 'user' && scope !== 'workspace') {
+        ctx.status = 400
+        ctx.body = { error: 'Field "scope" must be "user" or "workspace"' }
+        return
+      }
+      const result = await service.importExternal({
+        items: items as ExternalMcpCandidate[],
+        scope: scope as Scope,
+        cwd: typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined,
+      })
+      ctx.status = 200
+      ctx.body = result
+    } catch (err: unknown) {
+      ctx.status = (err as HttpError)?.statusCode ?? 500
+      ctx.body = { error: messageOf(err) || 'Failed to import external MCP configurations' }
+    }
+  })
+
+  // GET api/dsh-mcp-adapter/catalog
+  router.get(ROUTES.catalog, async (ctx: any) => {
+    try {
+      const result = service.listCatalog()
+      ctx.status = 200
+      ctx.body = { catalog: result }
+    } catch (err: unknown) {
+      ctx.status = (err as HttpError)?.statusCode ?? 500
+      ctx.body = { error: messageOf(err) || 'Failed to list MCP catalog' }
     }
   })
 }

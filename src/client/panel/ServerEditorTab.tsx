@@ -1,4 +1,4 @@
-import { useState, useSyncExternalStore, type ReactElement } from 'react'
+import { useEffect, useState, useSyncExternalStore, type ReactElement } from 'react'
 import type { McpServersApiClient } from '../api.ts'
 import { parseArgsString, type McpPanelController, type ServerDraft } from '../controller.ts'
 import { tt } from '../locales.ts'
@@ -37,6 +37,16 @@ export function ServerEditorTab({
   const originalName = snapshot.editingServer?.name
   const originalScope = snapshot.editingServer?.scope
   const titleText = isEditing ? tt('editor.title_edit') : tt('editor.title_create')
+
+  // A sheet that traps the pointer also has to answer the key everyone reaches for. Not while a
+  // save is in flight: the write is already on its way and closing would hide its outcome.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape' && !saving) controller.closeEditor()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [saving, controller])
 
   const handleFormChange = (patch: Partial<ServerDraft>): void => {
     setValidationMsg(null)
@@ -219,29 +229,35 @@ export function ServerEditorTab({
   const displayedError = validationMsg || saveError
 
   return (
-    <div className={css.editorContainer}>
-      {/* Top Breadcrumb */}
-      <div className={css.breadcrumb}>
-        <span
-          data-breadcrumb-back
-          className={css.breadcrumbLink}
-          onClick={() => controller.closeEditor()}
-        >
-          {tt('panel.title')}
-        </span>
-        <span className={css.breadcrumbSeparator}>&gt;</span>
-        <span className={css.breadcrumbCurrent}>{titleText}</span>
-      </div>
-
-      {/* Top Header */}
-      <div className={css.editorHeader}>
-        <div className={css.titleSection}>
-          <h2 className={css.editorTitle}>{titleText}</h2>
-          <p className={css.editorSubtitle}>{tt('editor.subtitle')}</p>
+    <div
+      className={css.sheetOverlay}
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !saving) controller.closeEditor()
+      }}
+    >
+      <div className={css.sheet} role="dialog" aria-modal="true" aria-labelledby="dsh-mcp-sheet-title">
+        <div className={css.sheetHead}>
+          <div className={css.sheetHeadCopy}>
+            <h2 id="dsh-mcp-sheet-title" className={css.sheetTitle}>{titleText}</h2>
+            <p className={css.sheetSub}>{tt('editor.subtitle')}</p>
+          </div>
+          <button
+            type="button"
+            data-sheet-close
+            className={css.sheetClose}
+            aria-label={tt('action.close')}
+            title={tt('action.close')}
+            onClick={() => controller.closeEditor()}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
         </div>
 
-        <div className={css.headerControls}>
-          {/* Scope Selector */}
+        <div className={css.sheetToolbar}>
           <div className={css.scopeSelector}>
             <span className={css.scopeLabel}>{tt('scope.label')}</span>
             <select
@@ -255,7 +271,7 @@ export function ServerEditorTab({
             </select>
           </div>
 
-          {/* Segmented Control [ 表单 | JSON ] */}
+          {/* JSON stays reachable for the configs a three-field form cannot express. */}
           <div className={css.segmentedControl} role="tablist">
             <button
               type="button"
@@ -279,46 +295,48 @@ export function ServerEditorTab({
             </button>
           </div>
         </div>
-      </div>
 
-      {/* Editor Body */}
-      <div className={css.editorBody}>
-        {snapshot.editorMode === 'form' ? (
-          <ServerFormView draft={snapshot.draft} onChange={handleFormChange} isEditing={isEditing} />
-        ) : (
-          <ServerJsonView
-            rawJson={snapshot.draft.rawJson ?? ''}
-            error={snapshot.jsonError}
-            onChange={handleJsonChange}
-          />
-        )}
-      </div>
+        <div className={css.sheetBody}>
+          {snapshot.editorMode === 'form' ? (
+            <ServerFormView draft={snapshot.draft} onChange={handleFormChange} isEditing={isEditing} />
+          ) : (
+            <ServerJsonView
+              rawJson={snapshot.draft.rawJson ?? ''}
+              error={snapshot.jsonError}
+              onChange={handleJsonChange}
+            />
+          )}
+        </div>
 
-      {/* Bottom Footer Actions */}
-      <div className={css.editorFooter}>
         {displayedError && (
-          <div className={css.saveError} role="alert">
+          <div className={css.sheetError} role="alert">
             {displayedError}
           </div>
         )}
-        <div className={css.footerActions}>
-          <button
-            type="button"
-            data-action="cancel"
-            className={css.secondaryButton}
-            onClick={() => controller.closeEditor()}
-          >
-            {tt('action.cancel')}
-          </button>
-          <button
-            type="button"
-            data-action="save"
-            className={css.primaryButton}
-            disabled={saving}
-            onClick={handleSave}
-          >
-            {saving ? tt('action.saving') : tt('action.save')}
-          </button>
+
+        <div className={css.sheetActions}>
+          {/* A brand-new server has no endpoint to test yet, so the note names the step instead. */}
+          {!isEditing && <span className={css.sheetNote}>{tt('editor.test_after_save')}</span>}
+          <div className={css.sheetActionsEnd}>
+            <button
+              type="button"
+              data-action="cancel"
+              className={css.secondaryButton}
+              onClick={() => controller.closeEditor()}
+              disabled={saving}
+            >
+              {tt('action.cancel')}
+            </button>
+            <button
+              type="button"
+              data-action="save"
+              className={css.primaryButton}
+              disabled={saving}
+              onClick={handleSave}
+            >
+              {saving ? tt('action.saving') : tt('action.save')}
+            </button>
+          </div>
         </div>
       </div>
     </div>

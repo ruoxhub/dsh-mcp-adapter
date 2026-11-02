@@ -16,10 +16,11 @@ export interface ServerDraft {
 
 export interface ControllerState {
   scope: 'user' | 'workspace'
+  filterTab?: 'all' | 'user' | 'workspace'
   /** The workspace whose `.mcp.json` this panel manages; `undefined` means the active project root. */
   workspacePath?: string
   searchQuery: string
-  viewMode: 'list' | 'editor'
+  viewMode: 'list' | 'editor' | 'market'
   editorMode: 'form' | 'json'
   editingServer: McpServerDetail | null
   draft: ServerDraft
@@ -73,6 +74,7 @@ export class McpPanelController {
     const scope = initialState?.scope ?? 'user'
     this.state = {
       scope,
+      filterTab: initialState?.filterTab ?? 'all',
       searchQuery: '',
       viewMode: 'list',
       editorMode: 'form',
@@ -116,6 +118,25 @@ export class McpPanelController {
   setScope(scope: 'user' | 'workspace'): void {
     if (this.state.scope === scope) return
     this.state.scope = scope
+    this.commit()
+  }
+
+  setFilterTab(tab: 'all' | 'user' | 'workspace'): void {
+    if (this.state.filterTab === tab) return
+    this.state.filterTab = tab
+    if (tab === 'user' || tab === 'workspace') {
+      this.state.scope = tab
+    }
+    this.commit()
+  }
+
+  openMarket(): void {
+    this.state.viewMode = 'market'
+    this.commit()
+  }
+
+  closeMarket(): void {
+    this.state.viewMode = 'list'
     this.commit()
   }
 

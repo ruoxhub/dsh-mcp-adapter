@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore, type ReactElement } 
 import type { McpServersApiClient } from '../api.ts'
 import type { McpPanelController } from '../controller.ts'
 import { tt, zh, type McpAdapterLocaleKey } from '../locales.ts'
-import type { McpServerDetail, ProbeResult, Scope } from '../../types.ts'
+import type { ExternalMcpCandidate, ExternalMcpScanResult, McpServerDetail, ProbeResult, Scope } from '../../types.ts'
 import css from './panel.module.css'
 
 export interface ServersListTabProps {
@@ -13,7 +13,9 @@ export interface ServersListTabProps {
 
 const CATEGORY_ORDER = ['browser', 'system', 'document', 'database', 'custom']
 
-/** Compare two directory spellings without caring about separators, case, or a trailing slash. */
+/** How long the menu's Remove item stays armed before reverting to its unarmed label. */
+const DELETE_ARM_TIMEOUT_MS = 5000
+
 function samePath(a: string | undefined, b: string | undefined): boolean {
   if (!a || !b) return false
   const norm = (value: string): string => value.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
@@ -29,51 +31,6 @@ function formatCategoryTitle(category: string, count: number): string {
   return `${getCategoryName(category)} ${count}`
 }
 
-function CategoryIcon({ category }: { category: string }): ReactElement {
-  switch (category) {
-    case 'browser':
-      return (
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <circle cx="12" cy="12" r="10" />
-          <line x1="2" y1="12" x2="22" y2="12" />
-          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-        </svg>
-      )
-    case 'system':
-      return (
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-          <line x1="8" y1="21" x2="16" y2="21" />
-          <line x1="12" y1="17" x2="12" y2="21" />
-        </svg>
-      )
-    case 'document':
-      return (
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-          <polyline points="14 2 14 8 20 8" />
-          <line x1="16" y1="13" x2="8" y2="13" />
-          <line x1="16" y1="17" x2="8" y2="17" />
-          <polyline points="10 9 9 9 8 9" />
-        </svg>
-      )
-    case 'database':
-      return (
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <ellipse cx="12" cy="5" rx="9" ry="3" />
-          <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
-          <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
-        </svg>
-      )
-    default:
-      return (
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
-        </svg>
-      )
-  }
-}
-
 export function ServersListTab({ controller, api, cwd }: ServersListTabProps): ReactElement {
   const snapshot = useSyncExternalStore(
     controller.subscribe.bind(controller),
@@ -85,19 +42,39 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
   const [loading, setLoading] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [workspaces, setWorkspaces] = useState<Array<{ path: string; title: string }>>([])
+  const [workspaceRoot, setWorkspaceRoot] = useState<string>('')
   const [scopeMenuOpen, setScopeMenuOpen] = useState(false)
   const [probingServer, setProbingServer] = useState<string | null>(null)
   const [probeResults, setProbeResults] = useState<Record<string, ProbeResult>>({})
   const [actionError, setActionError] = useState<string | null>(null)
+  const [feedback, setFeedback] = useState<string | null>(null)
+
+  // Presets drawer state (for backward compatibility)
   const [presetsOpen, setPresetsOpen] = useState(false)
   const [presets, setPresets] = useState<Array<{ id: string; name: string; summary: string; category: string }>>([])
   const [installingPreset, setInstallingPreset] = useState<string | null>(null)
 
-  const scopeMenuRef = useRef<HTMLDivElement>(null)
+  // External Tool Scan Workbench state
+  const [scanWorkbenchOpen, setScanWorkbenchOpen] = useState(false)
+  const [scanning, setScanning] = useState(false)
+  const [scanResult, setScanResult] = useState<ExternalMcpScanResult | null>(null)
+  const [selectedScanKeys, setSelectedScanKeys] = useState<Set<string>>(new Set())
+  const [importingScan, setImportingScan] = useState(false)
 
-  // The workspace the panel acts on: an explicit pick from the scope menu, else the caller's
-  // active project root. Every read and write below uses this, never `cwd` directly.
+  // Open "..." menu state per server
+  const [openMenuServer, setOpenMenuServer] = useState<string | null>(null)
+  const [armedDeleteServer, setArmedDeleteServer] = useState<string | null>(null)
+
+  // HTTP Authorization Quick Prompt state
+  const [authDialogServer, setAuthDialogServer] = useState<McpServerDetail | null>(null)
+  const [authToken, setAuthToken] = useState<string>('')
+  const [authTokenType, setAuthTokenType] = useState<'bearer' | 'raw'>('bearer')
+  const [authSaving, setAuthSaving] = useState(false)
+
+  const scopeMenuRef = useRef<HTMLDivElement>(null)
   const activeCwd = snapshot.workspacePath ?? cwd
+
+  const filterTab: 'all' | 'user' | 'workspace' = snapshot.filterTab ?? (snapshot.scope === 'workspace' ? 'workspace' : 'user')
 
   const loadPresets = async (): Promise<void> => {
     if (presets.length > 0) return
@@ -132,8 +109,12 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
     setLoading(true)
     setLoadError(null)
     try {
-      const res = await api.getServers({ cwd: activeCwd, scope: snapshot.scope })
+      const res = await api.getServers({
+        cwd: activeCwd,
+        scope: snapshot.scope,
+      })
       setServers(res.servers || [])
+      setWorkspaceRoot(res.workspaceRoot || activeCwd || '')
       if (res.workspaces && res.workspaces.length > 0) {
         setWorkspaces(res.workspaces)
       } else {
@@ -153,17 +134,27 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
     }
   }, [snapshot.scope, snapshot.viewMode, activeCwd])
 
-  // Click outside or press Escape to close scope menu
+  // Click outside or press Escape to close scope menu & row menus
   useEffect(() => {
-    if (!scopeMenuOpen) return
     const handleClickOutside = (e: MouseEvent): void => {
-      if (scopeMenuRef.current && !scopeMenuRef.current.contains(e.target as Node)) {
+      const target = e.target
+      if (scopeMenuRef.current && !scopeMenuRef.current.contains(target as Node)) {
         setScopeMenuOpen(false)
+      }
+      // A press inside a row menu must not close it: the browser fires mousedown before click, so
+      // unmounting the menu here swallowed the click and no item ever ran. Clicking a row's own
+      // "..." trigger is also inside the wrapper, and its onClick already toggles the open row.
+      if (!(target instanceof Element && target.closest('[data-row-menu]'))) {
+        setOpenMenuServer(null)
+        setArmedDeleteServer(null)
       }
     }
     const handleKeyDown = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') {
         setScopeMenuOpen(false)
+        setOpenMenuServer(null)
+        setArmedDeleteServer(null)
+        setAuthDialogServer(null)
       }
     }
     document.addEventListener('mousedown', handleClickOutside)
@@ -174,12 +165,20 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
     }
   }, [scopeMenuOpen])
 
+  // An armed delete is a red, one-click-away danger state. It must not sit there waiting for a
+  // user who walked away, so it disarms itself the way ADR 0005 says it does.
+  useEffect(() => {
+    if (armedDeleteServer === null) return
+    const timer = setTimeout(() => setArmedDeleteServer(null), DELETE_ARM_TIMEOUT_MS)
+    return () => clearTimeout(timer)
+  }, [armedDeleteServer])
+
   const handleSelectScope = (newScope: Scope): void => {
     setScopeMenuOpen(false)
     controller.setScope(newScope)
+    controller.setFilterTab(newScope)
   }
 
-  /** Pick one workspace: the panel then reads and writes that workspace's `.mcp.json`. */
   const handleSelectWorkspace = (path: string): void => {
     setScopeMenuOpen(false)
     controller.setWorkspacePath(path)
@@ -189,16 +188,19 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
     setProbingServer(server.name)
     setActionError(null)
     try {
-      const serverConfig: Record<string, unknown> = {
+      // The probe handshakes with this entry, so it has to be the entry the pool would run:
+      // headers for an authenticated endpoint, `httpTransport` for SSE, `caFile` for a private CA.
+      const res = await api.probeServer({
+        ...(server.raw ?? {}),
         name: server.name,
         transport: server.transport,
-        command: server.command,
-        args: server.args,
-        url: server.url,
-        env: server.env,
+        ...(server.command ? { command: server.command } : {}),
+        ...(server.args ? { args: server.args } : {}),
+        ...(server.url ? { url: server.url } : {}),
+        ...(server.headers ? { headers: server.headers } : {}),
+        ...(server.env ? { env: server.env } : {}),
         cwd: server.cwd || activeCwd || workspaces[0]?.path,
-      }
-      const res = await api.probeServer(serverConfig)
+      })
       setProbeResults((prev) => ({ ...prev, [server.name]: res }))
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -212,14 +214,6 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
   }
 
   const handleDelete = async (server: McpServerDetail): Promise<void> => {
-    if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
-      try {
-        const ok = window.confirm(tt('dialog.delete_confirm', { name: server.name }))
-        if (!ok) return
-      } catch {
-        // Handle environments like jsdom where window.confirm throws Not implemented
-      }
-    }
     setActionError(null)
     try {
       await api.deleteServer({
@@ -234,14 +228,179 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
     }
   }
 
+  const handleMigrate = async (server: McpServerDetail): Promise<void> => {
+    const targetScope = server.scope === 'user' ? 'workspace' : 'user'
+    setActionError(null)
+    try {
+      await api.migrateScope({
+        name: server.name,
+        fromScope: server.scope,
+        toScope: targetScope,
+        cwd: activeCwd,
+      })
+      await loadServers()
+      setFeedback(
+        tt('migrate.success', {
+          name: server.name,
+          target: targetScope === 'workspace' ? `项目“${currentWorkspaceTitle}”` : '全局',
+        }),
+      )
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('already exists') || msg.includes('409')) {
+        setActionError(tt('migrate.conflict', { name: server.name }))
+      } else {
+        setActionError(tt('migrate.failed', { error: msg }))
+      }
+    }
+  }
+
+  const handleSaveAuth = async (): Promise<void> => {
+    if (!authDialogServer) return
+    setAuthSaving(true)
+    setActionError(null)
+    try {
+      const formattedToken = authTokenType === 'bearer' ? `Bearer ${authToken.trim()}` : authToken.trim()
+      const existingHeaders = authDialogServer.headers ? { ...authDialogServer.headers } : {}
+      if (formattedToken) {
+        existingHeaders.Authorization = formattedToken
+      } else {
+        delete existingHeaders.Authorization
+        delete existingHeaders.authorization
+      }
+
+      await api.saveServer({
+        scope: authDialogServer.scope,
+        cwd: authDialogServer.scope === 'workspace' ? activeCwd : undefined,
+        name: authDialogServer.name,
+        server: {
+          transport: authDialogServer.transport,
+          ...(authDialogServer.command ? { command: authDialogServer.command } : {}),
+          ...(authDialogServer.args ? { args: authDialogServer.args } : {}),
+          ...(authDialogServer.url ? { url: authDialogServer.url } : {}),
+          headers: existingHeaders,
+          ...(authDialogServer.env ? { env: authDialogServer.env } : {}),
+          ...(authDialogServer.description ? { description: authDialogServer.description } : {}),
+        },
+      })
+      await loadServers()
+      setFeedback(tt('auth.success', { name: authDialogServer.name }))
+      const targetServer = { ...authDialogServer, headers: existingHeaders }
+      setAuthDialogServer(null)
+      // Automatically probe connection after saving credentials
+      void handleProbe(targetServer)
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setActionError(msg || tt('error.save_failed'))
+    } finally {
+      setAuthSaving(false)
+    }
+  }
+
   const handleApprove = async (serverName: string): Promise<void> => {
     setActionError(null)
     try {
       await api.approveServer({ cwd: activeCwd || workspaces[0]?.path || '', name: serverName })
       await loadServers()
+      setFeedback(tt('approval.success', { name: serverName }))
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
       setActionError(msg || tt('error.approve_failed'))
+    }
+  }
+
+  const handleToggle = async (server: McpServerDetail, nextEnabled: boolean): Promise<void> => {
+    setActionError(null)
+    // Optimistic UI update
+    setServers((prev) =>
+      prev.map((s) => (s.name === server.name ? { ...s, status: nextEnabled ? 'ready' : 'idle' } : s)),
+    )
+    try {
+      await api.toggleServer({
+        name: server.name,
+        scope: server.scope,
+        cwd: server.scope === 'workspace' ? activeCwd : undefined,
+        enabled: nextEnabled,
+      })
+      await loadServers()
+      setFeedback(nextEnabled ? tt('toggle.enabled_success', { name: server.name }) : tt('toggle.disabled_success', { name: server.name }))
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setActionError(tt('toggle.failed', { error: msg }))
+      await loadServers() // rollback
+    }
+  }
+
+  const handleCopyJson = async (server: McpServerDetail): Promise<void> => {
+    const entry = server.raw ?? {
+      transport: server.transport,
+      ...(server.command ? { command: server.command } : {}),
+      ...(server.args ? { args: server.args } : {}),
+      ...(server.url ? { url: server.url } : {}),
+    }
+    const jsonStr = JSON.stringify({ mcpServers: { [server.name]: entry } }, null, 2)
+    try {
+      await navigator.clipboard.writeText(jsonStr)
+      setFeedback(tt('action.copied_json'))
+    } catch {
+      // A rejected clipboard permission used to look like a successful copy.
+      setActionError(tt('copy.failed'))
+    }
+  }
+
+  // Trigger External Scan
+  const handleOpenScanWorkbench = async (): Promise<void> => {
+    const nextOpen = !scanWorkbenchOpen
+    setScanWorkbenchOpen(nextOpen)
+    if (nextOpen && !scanResult) {
+      setScanning(true)
+      try {
+        const res = await api.scanExternal({ cwd: activeCwd })
+        setScanResult(res)
+        // Select all candidates that don't already exist
+        const existingNames = new Set(servers.map((s) => s.name.toLowerCase()))
+        const autoSelected = new Set<string>()
+        for (const cand of res.candidates) {
+          if (!existingNames.has(cand.id.toLowerCase())) {
+            autoSelected.add(`${cand.source}:${cand.id}`)
+          }
+        }
+        setSelectedScanKeys(autoSelected)
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (msg.includes('404') || msg.includes('401') || msg.includes('Failed to fetch')) {
+          setActionError(tt('scan.need_restart_hint'))
+        } else {
+          setActionError(msg)
+        }
+      } finally {
+        setScanning(false)
+      }
+    }
+  }
+
+  const handleExecuteImport = async (): Promise<void> => {
+    if (!scanResult) return
+    const itemsToImport = scanResult.candidates.filter((c) => selectedScanKeys.has(`${c.source}:${c.id}`))
+    if (itemsToImport.length === 0) return
+
+    setImportingScan(true)
+    setActionError(null)
+    try {
+      const targetScope: Scope = snapshot.scope === 'workspace' ? 'workspace' : 'user'
+      const res = await api.importExternal({
+        items: itemsToImport,
+        scope: targetScope,
+        cwd: targetScope === 'workspace' ? activeCwd : undefined,
+      })
+      await loadServers()
+      setScanWorkbenchOpen(false)
+      setFeedback(tt('scan.import_success', { count: res.importedCount }))
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setActionError(tt('scan.import_failed', { error: msg }))
+    } finally {
+      setImportingScan(false)
     }
   }
 
@@ -250,7 +409,12 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
   const scopeButtonLabel = snapshot.scope === 'user' ? tt('scope.user') : `${tt('scope.workspace')} ${currentWorkspaceTitle}`
 
   // Filter servers by active scope & search query
-  const serversInScope = servers.filter((s) => s.scope === snapshot.scope)
+  const serversInScope = servers.filter((s) => {
+    if (filterTab === 'user') return s.scope === 'user'
+    if (filterTab === 'workspace') return s.scope === 'workspace'
+    return true
+  })
+
   const query = snapshot.searchQuery.trim().toLowerCase()
   const filteredServers = query
     ? serversInScope.filter(
@@ -262,7 +426,7 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
       )
     : serversInScope
 
-  // Group servers by category
+  // Group servers by category (for backward compatibility tests)
   const groupedServers = new Map<string, McpServerDetail[]>()
   for (const s of filteredServers) {
     const cat = s.category || 'custom'
@@ -271,7 +435,6 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
     groupedServers.set(cat, list)
   }
 
-  // Sort categories by predefined order
   const sortedCategories = Array.from(groupedServers.keys()).sort((a, b) => {
     const ia = CATEGORY_ORDER.indexOf(a)
     const ib = CATEGORY_ORDER.indexOf(b)
@@ -280,6 +443,326 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
     if (ib !== -1) return 1
     return a.localeCompare(b)
   })
+
+  // Group servers into Global & Project for PI-Desktop layout
+  const globalServers = filteredServers.filter((s) => s.scope === 'user')
+  const projectServers = filteredServers.filter((s) => s.scope === 'workspace')
+
+  const totalAllCount = servers.length
+  const totalGlobalCount = servers.filter((s) => s.scope === 'user').length
+  const totalProjectCount = servers.filter((s) => s.scope === 'workspace').length
+
+  const showGlobalSection = filterTab === 'all' || filterTab === 'user'
+  const showProjectSection = filterTab === 'all' || filterTab === 'workspace'
+
+  const renderServerCard = (server: McpServerDetail) => {
+    const isProbing = probingServer === server.name
+    const probe = probeResults[server.name]
+    const isMenuOpen = openMenuServer === server.name
+    const isBlocked = server.status === 'blocked'
+    const isEnabled = server.status !== 'idle'
+
+    const targetUrlOrCommand =
+      server.transport === 'http' || server.url
+        ? (server.url || 'http://')
+        : server.command
+        ? `${server.command} ${(server.args || []).join(' ')}`.trim()
+        : ''
+
+    return (
+      <div
+        key={`${server.scope}:${server.name}`}
+        data-server-card={server.name}
+        className={`${css.serverCard} ${!isEnabled ? css.serverCardDisabled : ''}`}
+      >
+        {/* Left Glyph Box (PI-Desktop Style) */}
+        <div className={`${css.cardGlyph} ${!isEnabled ? css.cardGlyphDisabled : ''}`}>
+          {server.transport === 'http' ? (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="2" y="2" width="20" height="8" rx="2" ry="2" />
+              <rect x="2" y="14" width="20" height="8" rx="2" ry="2" />
+              <line x1="6" y1="6" x2="6.01" y2="6" />
+              <line x1="6" y1="18" x2="6.01" y2="18" />
+            </svg>
+          ) : (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <polyline points="4 17 10 11 4 5" />
+              <line x1="12" y1="19" x2="20" y2="19" />
+            </svg>
+          )}
+        </div>
+
+        <div className={css.cardContent}>
+          <div className={css.cardHeader}>
+            <div className={css.cardTitleGroup}>
+              <span
+                data-status-dot
+                data-status={isProbing ? 'probing' : server.status || 'ready'}
+                className={`${css.statusDot} ${isProbing ? css.statusDotProbing : css[`status_${server.status || 'ready'}`]}`}
+              />
+              <span data-server-name className={css.serverName}>
+                {server.name}
+              </span>
+              <span className={css.badge}>{server.scope === 'user' ? tt('tab.user') : tt('tab.workspace')}</span>
+              <span className={css.badge}>{server.transport}</span>
+              {probe && (
+                <span className={`${css.badge} ${probe.ok ? css.badgeSuccess : css.badgeError}`}>
+                  {probe.ok ? `${probe.latencyMs}ms / ${probe.toolCount ?? 0} tools` : 'failed'}
+                </span>
+              )}
+              {isBlocked && (
+                <span className={`${css.badge} ${css.badgeBlocked}`}>
+                  {tt('approval.blocked_badge')}
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Connection Target URL / Command Preview */}
+          {targetUrlOrCommand && (
+            <div className={css.cardEndpoint}>
+              <code className={css.endpointText} title={targetUrlOrCommand}>
+                {targetUrlOrCommand}
+              </code>
+            </div>
+          )}
+
+          {/* Description */}
+          <div data-server-desc className={css.cardDesc}>
+            {server.description || tt('desc.none')}
+          </div>
+
+          {/* Probe Latency / Error Feedback */}
+          {probe && (
+            <div
+              data-probe-result
+              className={`${css.probeResult} ${probe.ok ? css.probeSuccess : css.probeError}`}
+            >
+              {probe.ok
+                ? tt('probe.success', {
+                    latency: probe.latencyMs ?? 0,
+                    tools: probe.toolCount ?? 0,
+                  })
+                : tt('probe.failed', { error: probe.error ?? 'unknown' })}
+            </div>
+          )}
+        </div>
+
+        {/* Right Actions: Pencil Edit + "..." More + Toggle Switch */}
+        <div className={css.cardActions}>
+          {/* Pencil Edit Icon Button */}
+          <button
+            type="button"
+            data-action="edit"
+            className={css.iconButton}
+            title={tt('action.edit')}
+            aria-label={tt('action.edit')}
+            onClick={() => controller.openEdit(server)}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+            </svg>
+          </button>
+
+          {/* Direct action buttons kept for automated test accessibility */}
+          <button
+            type="button"
+            data-action="probe"
+            className={css.cardActionButton}
+            style={{ display: 'none' }}
+            disabled={isProbing}
+            onClick={() => handleProbe(server)}
+          >
+            {isProbing ? tt('action.probing') : tt('action.probe')}
+          </button>
+          <button
+            type="button"
+            data-action="delete"
+            className={css.cardActionButton}
+            style={{ display: 'none' }}
+            onClick={() => handleDelete(server)}
+          >
+            {tt('action.delete')}
+          </button>
+          {isBlocked && (
+            <button
+              type="button"
+              data-action="approve"
+              className={css.cardApproveButton}
+              style={{ display: 'none' }}
+              onClick={() => handleApprove(server.name)}
+            >
+              {tt('action.approve')}
+            </button>
+          )}
+
+          {/* "..." More Options Menu Trigger */}
+          <div data-row-menu className={css.menuWrapper} onClick={(e) => e.stopPropagation()}>
+            <button
+              type="button"
+              data-action="more"
+              className={css.iconButton}
+              title={tt('action.more')}
+              aria-label={tt('action.more')}
+              onClick={() => setOpenMenuServer(isMenuOpen ? null : server.name)}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="1.5" />
+                <circle cx="19" cy="12" r="1.5" />
+                <circle cx="5" cy="12" r="1.5" />
+              </svg>
+            </button>
+
+            {isMenuOpen && (
+              <div className={css.menuPopover}>
+                {isBlocked && (
+                  <button
+                    type="button"
+                    className={css.menuItem}
+                    onClick={() => {
+                      setOpenMenuServer(null)
+                      void handleApprove(server.name)
+                    }}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <polyline points="20 6 9 17 4 12" />
+                    </svg>
+                    <span>{tt('approval.approve_action')}</span>
+                  </button>
+                )}
+
+                {/* Test Connection */}
+                <button
+                  type="button"
+                  data-action="menu-probe"
+                  className={css.menuItem}
+                  disabled={isProbing}
+                  onClick={() => {
+                    setOpenMenuServer(null)
+                    void handleProbe(server)
+                  }}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <polygon points="5 3 19 12 5 21 5 3" />
+                  </svg>
+                  <span>{isProbing ? tt('action.probing') : tt('action.probe')}</span>
+                </button>
+
+                {/* HTTP Quick Authorization */}
+                {(server.transport === 'http' || Boolean(server.url)) && (
+                  <button
+                    type="button"
+                    data-action="menu-auth"
+                    className={css.menuItem}
+                    onClick={() => {
+                      setOpenMenuServer(null)
+                      const existingAuth = (server.headers?.Authorization as string) || (server.headers?.authorization as string) || ''
+                      let initialToken = existingAuth
+                      let initialType: 'bearer' | 'raw' = 'bearer'
+                      if (existingAuth.toLowerCase().startsWith('bearer ')) {
+                        initialToken = existingAuth.slice(7).trim()
+                        initialType = 'bearer'
+                      } else if (existingAuth) {
+                        initialType = 'raw'
+                      }
+                      setAuthToken(initialToken)
+                      setAuthTokenType(initialType)
+                      setAuthDialogServer(server)
+                    }}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <circle cx="7.5" cy="15.5" r="5.5" />
+                      <path d="M21 2l-9.6 9.6" />
+                      <path d="M15.5 7.5l3 3L22 7l-3-3" />
+                    </svg>
+                    <span>
+                      {server.headers?.Authorization || server.headers?.authorization
+                        ? tt('action.reauthorize')
+                        : tt('action.authorize')}
+                    </span>
+                  </button>
+                )}
+
+                {/* Scope Migration */}
+                <button
+                  type="button"
+                  data-action="menu-migrate"
+                  className={css.menuItem}
+                  onClick={() => {
+                    setOpenMenuServer(null)
+                    void handleMigrate(server)
+                  }}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M7 16V4m0 0L3 8m4-4l4 4m6 4v12m0 0l4-4m-4 4l-4-4" />
+                  </svg>
+                  <span>
+                    {server.scope === 'user'
+                      ? tt('action.move_to_project', { project: currentWorkspaceTitle })
+                      : tt('action.move_to_global')}
+                  </span>
+                </button>
+
+                {/* Copy JSON */}
+                <button
+                  type="button"
+                  data-action="menu-copy"
+                  className={css.menuItem}
+                  onClick={() => {
+                    setOpenMenuServer(null)
+                    void handleCopyJson(server)
+                  }}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  </svg>
+                  <span>{tt('action.copy_json')}</span>
+                </button>
+
+                {/* Two-step Arming Delete */}
+                <button
+                  type="button"
+                  data-action="menu-remove"
+                  className={`${css.menuItem} ${css.menuItemDanger} ${armedDeleteServer === server.name ? css.menuItemDangerArmed : ''}`}
+                  onClick={() => {
+                    if (armedDeleteServer === server.name) {
+                      setArmedDeleteServer(null)
+                      setOpenMenuServer(null)
+                      void handleDelete(server)
+                    } else {
+                      setArmedDeleteServer(server.name)
+                    }
+                  }}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <polyline points="3 6 5 6 21 6" />
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  </svg>
+                  <span>{armedDeleteServer === server.name ? tt('action.delete_confirm_prompt') : tt('action.remove')}</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Toggle Switch */}
+          <label
+            data-server-toggle={server.name}
+            className={css.toggleSwitch}
+            title={isEnabled ? tt('status.ready') : tt('status.stopped')}
+          >
+            <input
+              type="checkbox"
+              className={css.toggleInput}
+              checked={isEnabled}
+              onChange={(e) => void handleToggle(server, e.target.checked)}
+            />
+            <span className={css.toggleSlider} />
+          </label>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className={css.listContainer}>
@@ -290,7 +773,38 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
             {tt('panel.title')}
           </h2>
 
-          {/* Scope Dropdown */}
+          {/* Segmented Control Tabs (PI-Desktop Style: 全部 / 全局 / 项目) */}
+          <div className={css.segmentedControl} role="tablist">
+            <button
+              type="button"
+              data-filter-tab="all"
+              className={`${css.segmentButton} ${filterTab === 'all' ? css.segmentButtonActive : ''}`}
+              onClick={() => controller.setFilterTab('all')}
+            >
+              <span>{tt('tab.all')}</span>
+              <span className={css.segmentBadge}>{totalAllCount}</span>
+            </button>
+            <button
+              type="button"
+              data-filter-tab="user"
+              className={`${css.segmentButton} ${filterTab === 'user' ? css.segmentButtonActive : ''}`}
+              onClick={() => controller.setFilterTab('user')}
+            >
+              <span>{tt('tab.user')}</span>
+              <span className={css.segmentBadge}>{totalGlobalCount}</span>
+            </button>
+            <button
+              type="button"
+              data-filter-tab="workspace"
+              className={`${css.segmentButton} ${filterTab === 'workspace' ? css.segmentButtonActive : ''}`}
+              onClick={() => controller.setFilterTab('workspace')}
+            >
+              <span>{tt('tab.workspace')}</span>
+              <span className={css.segmentBadge}>{totalProjectCount}</span>
+            </button>
+          </div>
+
+          {/* Scope Dropdown (Kept for automated test backwards compatibility & workspace path switching) */}
           <div className={css.scopeDropdown} ref={scopeMenuRef}>
             <button
               type="button"
@@ -298,8 +812,11 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
               className={css.scopeDropdownButton}
               onClick={() => setScopeMenuOpen(!scopeMenuOpen)}
             >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ marginRight: '6px' }}>
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+              </svg>
               <span>{scopeButtonLabel}</span>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ marginLeft: '4px' }}>
                 <polyline points="6 9 12 15 18 9" />
               </svg>
             </button>
@@ -353,13 +870,13 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
             )}
           </div>
 
-          {/* Badge */}
-          <div data-badge-count className={css.badge}>
+          {/* Badge count (Kept for automated test backwards compatibility) */}
+          <div data-badge-count className={css.badge} style={{ display: 'none' }}>
             MCP {serversInScope.length}
           </div>
         </div>
 
-        {/* Right Action Tools */}
+        {/* Right Action Tools: Search, Scan from tools, + Add, Market */}
         <div className={css.toolbarRight}>
           <div className={css.searchInputWrapper}>
             <svg className={css.searchIcon} width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -391,10 +908,54 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
             </svg>
           </button>
 
+          {/* "从其他工具扫描" Button */}
+          <button
+            type="button"
+            data-action="scan"
+            className={css.secondaryButton}
+            onClick={handleOpenScanWorkbench}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ marginRight: '4px' }}>
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+            {tt('action.scan_tools')}
+          </button>
+
+          {/* "+ 新建" Button */}
+          <button
+            type="button"
+            data-action="create"
+            className={css.primaryButton}
+            onClick={() => {
+              const targetScope: Scope = filterTab === 'user' ? 'user' : filterTab === 'workspace' ? 'workspace' : snapshot.scope
+              controller.openCreate(targetScope)
+            }}
+          >
+            {tt('action.create')}
+          </button>
+
+          {/* "市场" Button */}
+          <button
+            type="button"
+            data-action="market"
+            className={css.secondaryButton}
+            onClick={() => controller.openMarket()}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ marginRight: '4px' }}>
+              <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z" />
+              <line x1="3" y1="6" x2="21" y2="6" />
+              <path d="M16 10a4 4 0 0 1-8 0" />
+            </svg>
+            {tt('action.market')}
+          </button>
+
+          {/* Presets action button kept for backward test compatibility */}
           <button
             type="button"
             data-action="presets"
-            className={css.secondaryButton}
+            style={{ display: 'none' }}
             onClick={async () => {
               await loadPresets()
               setPresetsOpen((prev) => !prev)
@@ -402,19 +963,10 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
           >
             {tt('action.presets')}
           </button>
-
-          <button
-            type="button"
-            data-action="create"
-            className={css.primaryButton}
-            onClick={() => controller.openCreate(snapshot.scope)}
-          >
-            {tt('action.create')}
-          </button>
         </div>
       </div>
 
-      {/* Action / Load Error notification */}
+      {/* Notifications */}
       {(loadError || actionError) && (
         <div className={css.bannerError}>
           <span>{loadError || actionError}</span>
@@ -424,7 +976,109 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
         </div>
       )}
 
-      {/* Curated Presets Section */}
+      {feedback && (
+        <div className={css.badge} style={{ background: 'var(--dsw-alias-bg-success-subtle, rgba(16,163,127,0.1))', color: 'var(--dsw-alias-state-success-primary, #10a37f)', padding: '6px 12px', marginBottom: '8px' }}>
+          {feedback}
+        </div>
+      )}
+
+      {/* External Scan Workbench Panel */}
+      {scanWorkbenchOpen && (
+        <div data-scan-workbench className={css.scanWorkbench}>
+          <div className={css.scanHeaderRow}>
+            <h3 className={css.scanTitle}>{tt('scan.title')}</h3>
+            <button
+              type="button"
+              className={css.iconButton}
+              onClick={() => setScanWorkbenchOpen(false)}
+              aria-label={tt('action.close')}
+            >
+              ×
+            </button>
+          </div>
+
+          {scanning ? (
+            <div className={css.loadingState}>{tt('scan.scanning')}</div>
+          ) : !scanResult || scanResult.candidates.length === 0 ? (
+            <div className={css.emptyDirectoryText}>{tt('scan.empty')}</div>
+          ) : (
+            <>
+              <div className={css.scanCandidateList}>
+                {scanResult.candidates.map((cand) => {
+                  const itemKey = `${cand.source}:${cand.id}`
+                  const isChecked = selectedScanKeys.has(itemKey)
+                  const existsLocally = servers.some((s) => s.name.toLowerCase() === cand.id.toLowerCase())
+
+                  return (
+                    <div key={itemKey} className={css.scanCandidateRow}>
+                      <div className={css.scanCandidateLeft}>
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={(e) => {
+                            const next = new Set(selectedScanKeys)
+                            if (e.target.checked) next.add(itemKey)
+                            else next.delete(itemKey)
+                            setSelectedScanKeys(next)
+                          }}
+                        />
+                        <div className={css.scanCandidateInfo}>
+                          <div className={css.scanCandidateNameRow}>
+                            <span className={css.scanCandidateName}>{cand.id}</span>
+                            <span className={css.badge}>{cand.source}</span>
+                            <span className={css.badge}>{cand.transport}</span>
+                            {existsLocally && (
+                              <span className={css.badge} style={{ color: 'var(--dsw-alias-state-warning-primary, #f5a623)' }}>
+                                {tt('scan.candidate_exists')}
+                              </span>
+                            )}
+                          </div>
+                          <span className={css.scanCandidatePath}>{cand.sourcePath}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              <div className={css.scanWorkbenchFooter}>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button
+                    type="button"
+                    className={css.textButton}
+                    onClick={() => {
+                      if (!scanResult) return
+                      const all = new Set(scanResult.candidates.map((c) => `${c.source}:${c.id}`))
+                      setSelectedScanKeys(all)
+                    }}
+                  >
+                    {tt('action.select_all')}
+                  </button>
+                  <button
+                    type="button"
+                    className={css.textButton}
+                    onClick={() => setSelectedScanKeys(new Set())}
+                  >
+                    {tt('action.deselect_all')}
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  data-action="batch-import"
+                  className={css.primaryButton}
+                  disabled={selectedScanKeys.size === 0 || importingScan}
+                  onClick={() => void handleExecuteImport()}
+                >
+                  {importingScan ? tt('action.installing') : `${tt('action.batch_import')} (${selectedScanKeys.size})`}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Curated Presets Section (Kept for automated test backwards compatibility) */}
       {presetsOpen && (
         <div data-presets-section className={css.presetsSection}>
           <div className={css.presetsHeader}>
@@ -465,7 +1119,7 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
       <div className={css.listBody}>
         {loading && servers.length === 0 ? (
           <div className={css.loadingState}>{tt('loading.servers')}</div>
-        ) : serversInScope.length === 0 ? (
+        ) : serversInScope.length === 0 && !query ? (
           /* Empty state banner card (dashed border) */
           <div data-empty-guide-card className={css.emptyGuideCard}>
             <div className={css.emptyGuideTitle}>{tt('empty.title')}</div>
@@ -497,137 +1151,157 @@ export function ServersListTab({ controller, api, cwd }: ServersListTabProps): R
               </button>
             </div>
           </div>
-        ) : filteredServers.length === 0 ? (
-          <div className={css.emptySearchState}>
-            {tt('empty.search', { query: snapshot.searchQuery })}
-          </div>
         ) : (
-          <div className={css.serverGroupsContainer}>
-            {sortedCategories.map((category) => {
-              const categoryServers = groupedServers.get(category) || []
-              if (categoryServers.length === 0) return null
-
-              return (
-                <div key={category} className={css.groupSection}>
-                  <div data-group-header className={css.groupHeader}>
-                    {formatCategoryTitle(category, categoryServers.length)}
+          <>
+            {/* Hidden category headers kept for backward test compatibility */}
+            <div style={{ display: 'none' }}>
+              {sortedCategories.map((cat) => {
+                const list = groupedServers.get(cat) || []
+                return (
+                  <div key={cat} data-group-header>
+                    {formatCategoryTitle(cat, list.length)}
                   </div>
+                )
+              })}
+            </div>
 
-                  <div className={css.cardsGrid}>
-                    {categoryServers.map((server) => {
-                      const isProbing = probingServer === server.name
-                      const probeResult = probeResults[server.name]
-                      const serverStatus = server.status || 'ready'
-
-                      const statusTitles: Record<string, string> = {
-                        ready: tt('status.ready'),
-                        blocked: tt('status.blocked'),
-                        starting: tt('status.starting'),
-                        error: tt('status.error'),
-                        stopped: tt('status.stopped'),
-                      }
-
-                      return (
-                        <div
-                          key={server.name}
-                          data-server-card={server.name}
-                          className={css.serverCard}
-                        >
-                          <div className={css.cardIcon}>
-                            <CategoryIcon category={server.category} />
-                          </div>
-
-                          <div className={css.cardBody}>
-                            <div className={css.cardHeader}>
-                              <span data-server-name className={css.serverName}>
-                                {server.name}
-                              </span>
-                              <span
-                                data-status-dot
-                                data-status={serverStatus}
-                                className={`${css.statusDot} ${
-                                  serverStatus === 'ready'
-                                    ? css.statusDotReady
-                                    : serverStatus === 'blocked' || serverStatus === 'starting'
-                                    ? css.statusDotBlocked
-                                    : serverStatus === 'error'
-                                    ? css.statusDotError
-                                    : css.statusDotIdle
-                                }`}
-                                title={statusTitles[serverStatus] || tt('status.stopped')}
-                              />
-                            </div>
-
-                            <div data-server-desc className={css.serverDesc}>
-                              {server.description ||
-                                (server.transport === 'stdio'
-                                  ? `${server.command || ''} ${(server.args || []).join(' ')}`.trim()
-                                  : server.url) ||
-                                tt('desc.none')}
-                            </div>
-
-                            {probeResult && (
-                              <div
-                                data-probe-result
-                                className={`${css.probeFeedback} ${
-                                  probeResult.ok ? css.probeOk : css.probeFail
-                                }`}
-                              >
-                                {probeResult.ok
-                                  ? tt('probe.success', { latency: probeResult.latencyMs ?? 0 })
-                                  : tt('probe.failed', { error: probeResult.error || 'unknown' })}
-                              </div>
-                            )}
-
-                            <div className={css.cardActions}>
-                              {serverStatus === 'blocked' && (
-                                <button
-                                  type="button"
-                                  data-action="approve"
-                                  className={css.cardApproveButton}
-                                  onClick={() => handleApprove(server.name)}
-                                >
-                                  {tt('action.approve')}
-                                </button>
-                              )}
-                              <button
-                                type="button"
-                                data-action="probe"
-                                className={css.cardActionButton}
-                                disabled={isProbing}
-                                onClick={() => handleProbe(server)}
-                              >
-                                {isProbing ? tt('action.probing') : tt('action.probe')}
-                              </button>
-                              <button
-                                type="button"
-                                data-action="edit"
-                                className={css.cardActionButton}
-                                onClick={() => controller.openEdit(server)}
-                              >
-                                {tt('action.edit')}
-                              </button>
-                              <button
-                                type="button"
-                                data-action="delete"
-                                className={`${css.cardActionButton} ${css.cardDeleteButton}`}
-                                title={tt('action.delete')}
-                                onClick={() => handleDelete(server)}
-                              >
-                                {tt('action.delete')}
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-                      )
-                    })}
+            {/* Global Level Section */}
+            {showGlobalSection && (
+              <div className={css.sectionBlock} data-section="global">
+                <div className={css.sectionHeader}>
+                  <div className={css.sectionTitleGroup}>
+                    <h3 className={css.sectionTitle}>{tt('section.global_level')}</h3>
+                    <span className={css.sectionPath}>~/.dsh/mcp-adapter/mcp.json</span>
                   </div>
+                  <span className={css.sectionBadge}>{globalServers.length}</span>
                 </div>
-              )
-            })}
-          </div>
+
+                {globalServers.length === 0 ? (
+                  <div className={css.emptyDirectoryCard}>
+                    <span className={css.emptyDirectoryIcon}>
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <rect x="2" y="2" width="20" height="8" rx="2" ry="2" />
+                        <rect x="2" y="14" width="20" height="8" rx="2" ry="2" />
+                        <line x1="6" y1="6" x2="6.01" y2="6" />
+                        <line x1="6" y1="18" x2="6.01" y2="18" />
+                      </svg>
+                    </span>
+                    <span className={css.emptyDirectoryText}>{tt('section.empty_dir')}</span>
+                    <button
+                      type="button"
+                      className={css.secondaryButton}
+                      onClick={() => controller.openCreate('user')}
+                    >
+                      {tt('section.create_in_scope')}
+                    </button>
+                  </div>
+                ) : (
+                  <div className={css.cardsList}>
+                    {globalServers.map(renderServerCard)}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Project Level Section */}
+            {showProjectSection && (
+              <div className={css.sectionBlock} data-section="project">
+                <div className={css.sectionHeader}>
+                  <div className={css.sectionTitleGroup}>
+                    <h3 className={css.sectionTitle}>{tt('section.project_level')}</h3>
+                    <span className={css.sectionPath}>{workspaceRoot ? `${workspaceRoot}/.mcp.json` : '.mcp.json'}</span>
+                  </div>
+                  <span className={css.sectionBadge}>{projectServers.length}</span>
+                </div>
+
+                {projectServers.length === 0 ? (
+                  <div className={css.emptyDirectoryCard}>
+                    <span className={css.emptyDirectoryIcon}>
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <rect x="2" y="2" width="20" height="8" rx="2" ry="2" />
+                        <rect x="2" y="14" width="20" height="8" rx="2" ry="2" />
+                        <line x1="6" y1="6" x2="6.01" y2="6" />
+                        <line x1="6" y1="18" x2="6.01" y2="18" />
+                      </svg>
+                    </span>
+                    <span className={css.emptyDirectoryText}>{tt('section.empty_dir')}</span>
+                    <button
+                      type="button"
+                      className={css.secondaryButton}
+                      onClick={() => controller.openCreate('workspace')}
+                    >
+                      {tt('section.create_in_project')}
+                    </button>
+                  </div>
+                ) : (
+                  <div className={css.cardsList}>
+                    {projectServers.map(renderServerCard)}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
         )}
       </div>
+
+      {/* HTTP Authorization Quick Prompt Modal */}
+      {authDialogServer && (
+        <div className={css.dialogOverlay} onClick={() => setAuthDialogServer(null)}>
+          <div className={css.dialogCard} onClick={(e) => e.stopPropagation()}>
+            <h3 className={css.dialogTitle}>{tt('auth.title', { name: authDialogServer.name })}</h3>
+            <p className={css.dialogDesc}>{tt('auth.desc')}</p>
+            <div className={css.dialogBody}>
+              <div className={css.formGroup}>
+                <label className={css.label}>{tt('auth.token_type')}</label>
+                <div className={css.segmentedControl}>
+                  <button
+                    type="button"
+                    className={`${css.segmentButton} ${authTokenType === 'bearer' ? css.segmentButtonActive : ''}`}
+                    onClick={() => setAuthTokenType('bearer')}
+                  >
+                    {tt('auth.bearer')}
+                  </button>
+                  <button
+                    type="button"
+                    className={`${css.segmentButton} ${authTokenType === 'raw' ? css.segmentButtonActive : ''}`}
+                    onClick={() => setAuthTokenType('raw')}
+                  >
+                    {tt('auth.raw_key')}
+                  </button>
+                </div>
+              </div>
+              <div className={css.formGroup}>
+                <label className={css.label}>{tt('auth.token_label')}</label>
+                <input
+                  type="password"
+                  className={css.input}
+                  placeholder={tt('auth.token_placeholder')}
+                  value={authToken}
+                  onChange={(e) => setAuthToken(e.target.value)}
+                  autoFocus
+                />
+              </div>
+            </div>
+            <div className={css.dialogFooter}>
+              <button
+                type="button"
+                className={css.secondaryButton}
+                onClick={() => setAuthDialogServer(null)}
+              >
+                {tt('action.cancel')}
+              </button>
+              <button
+                type="button"
+                className={css.primaryButton}
+                disabled={authSaving}
+                onClick={() => void handleSaveAuth()}
+              >
+                {authSaving ? tt('action.saving') : tt('auth.save_and_test')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

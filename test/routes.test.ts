@@ -71,7 +71,7 @@ describe('Mcp Routes & WebServer Registration', () => {
     it('returns exact web routes matching DSH Host WebServer interface', () => {
       const mockService = {} as unknown as McpServersService
       const routes = createMcpWebRoutes(mockService)
-      expect(routes).toHaveLength(7)
+      expect(routes).toHaveLength(12)
       for (const route of routes) {
         expect(route.kind).toBe('exact')
         expect(typeof route.handler).toBe('function')
@@ -83,6 +83,13 @@ describe('Mcp Routes & WebServer Registration', () => {
       expect(paths).toContain('/api/dsh-mcp-adapter/approve')
       expect(paths).toContain('/api/dsh-mcp-adapter/delete')
       expect(paths).toContain('/api/dsh-mcp-adapter/probe')
+      expect(paths).toContain('/api/dsh-mcp-adapter/presets')
+      expect(paths).toContain('/api/dsh-mcp-adapter/presets/install')
+      expect(paths).toContain('/api/dsh-mcp-adapter/toggle')
+      expect(paths).toContain('/api/dsh-mcp-adapter/migrate-scope')
+      expect(paths).toContain('/api/dsh-mcp-adapter/scan-external')
+      expect(paths).toContain('/api/dsh-mcp-adapter/import-external')
+      expect(paths).toContain('/api/dsh-mcp-adapter/catalog')
     })
   })
 
@@ -522,6 +529,115 @@ describe('Mcp Routes & WebServer Registration', () => {
       })
     })
 
+    describe('POST /api/dsh-mcp-adapter/toggle', () => {
+      it('toggles server status and returns 200 ok', async () => {
+        const service = {
+          toggleServer: vi.fn().mockResolvedValue({ ok: true, enabled: false }),
+        } as unknown as McpServersService
+        const route = findRoute(createMcpWebRoutes(service), '/api/dsh-mcp-adapter/toggle')
+        const req = createMockReq({
+          method: 'POST',
+          url: '/api/dsh-mcp-adapter/toggle',
+          body: { name: 'tavily', scope: 'user', enabled: false },
+        })
+        const { res, getStatusCode, getBody } = createMockRes()
+
+        await route.handler(req, res)
+        expect(service.toggleServer).toHaveBeenCalledWith({ name: 'tavily', scope: 'user', cwd: undefined, enabled: false })
+        expect(getStatusCode()).toBe(200)
+        expect(getBody()).toEqual({ ok: true, enabled: false })
+      })
+
+      it('validates required fields (name, scope, enabled)', async () => {
+        const service = { toggleServer: vi.fn() } as unknown as McpServersService
+        const route = findRoute(createMcpWebRoutes(service), '/api/dsh-mcp-adapter/toggle')
+
+        let req = createMockReq({ method: 'POST', url: '/api/dsh-mcp-adapter/toggle', body: { scope: 'user', enabled: true } })
+        let mock = createMockRes()
+        await route.handler(req, mock.res)
+        expect(mock.getStatusCode()).toBe(400)
+        expect(mock.getBody().error).toContain('name')
+
+        req = createMockReq({ method: 'POST', url: '/api/dsh-mcp-adapter/toggle', body: { name: 's1', scope: 'invalid', enabled: true } })
+        mock = createMockRes()
+        await route.handler(req, mock.res)
+        expect(mock.getStatusCode()).toBe(400)
+        expect(mock.getBody().error).toContain('scope')
+
+        req = createMockReq({ method: 'POST', url: '/api/dsh-mcp-adapter/toggle', body: { name: 's1', scope: 'user', enabled: 'not-bool' } })
+        mock = createMockRes()
+        await route.handler(req, mock.res)
+        expect(mock.getStatusCode()).toBe(400)
+        expect(mock.getBody().error).toContain('boolean')
+      })
+    })
+
+    describe('GET /api/dsh-mcp-adapter/scan-external', () => {
+      it('scans external MCP sources and returns 200 ok', async () => {
+        const mockScanResult = {
+          candidates: [{ source: 'claude-desktop', sourcePath: '/path', id: 'fs', rawKey: 'fs', transport: 'stdio' }],
+          sources: [{ kind: 'claude-desktop', path: '/path', exists: true, count: 1 }],
+        }
+        const service = {
+          scanExternal: vi.fn().mockReturnValue(mockScanResult),
+        } as unknown as McpServersService
+        const route = findRoute(createMcpWebRoutes(service), '/api/dsh-mcp-adapter/scan-external')
+        const req = createMockReq({ method: 'GET', url: '/api/dsh-mcp-adapter/scan-external?cwd=/workspace' })
+        const { res, getStatusCode, getBody } = createMockRes()
+
+        await route.handler(req, res)
+        expect(service.scanExternal).toHaveBeenCalledWith({ cwd: '/workspace' })
+        expect(getStatusCode()).toBe(200)
+        expect(getBody()).toEqual(mockScanResult)
+      })
+    })
+
+    describe('POST /api/dsh-mcp-adapter/import-external', () => {
+      it('batch imports external candidates and returns 200 ok', async () => {
+        const service = {
+          importExternal: vi.fn().mockResolvedValue({ ok: true, importedCount: 2, errors: [] }),
+        } as unknown as McpServersService
+        const route = findRoute(createMcpWebRoutes(service), '/api/dsh-mcp-adapter/import-external')
+        const req = createMockReq({
+          method: 'POST',
+          url: '/api/dsh-mcp-adapter/import-external',
+          body: {
+            items: [
+              { source: 'cursor-global', sourcePath: '/p1', id: 's1', rawKey: 's1', transport: 'stdio' },
+              { source: 'cursor-global', sourcePath: '/p2', id: 's2', rawKey: 's2', transport: 'http' },
+            ],
+            scope: 'workspace',
+          },
+        })
+        const { res, getStatusCode, getBody } = createMockRes()
+
+        await route.handler(req, res)
+        expect(service.importExternal).toHaveBeenCalledWith({
+          items: expect.any(Array),
+          scope: 'workspace',
+          cwd: undefined,
+        })
+        expect(getStatusCode()).toBe(200)
+        expect(getBody()).toEqual({ ok: true, importedCount: 2, errors: [] })
+      })
+    })
+
+    describe('GET /api/dsh-mcp-adapter/catalog', () => {
+      it('returns curated catalog and returns 200 ok', async () => {
+        const service = {
+          listCatalog: vi.fn().mockReturnValue([{ id: 'memory', name: 'Memory' }]),
+        } as unknown as McpServersService
+        const route = findRoute(createMcpWebRoutes(service), '/api/dsh-mcp-adapter/catalog')
+        const req = createMockReq({ method: 'GET', url: '/api/dsh-mcp-adapter/catalog' })
+        const { res, getStatusCode, getBody } = createMockRes()
+
+        await route.handler(req, res)
+        expect(service.listCatalog).toHaveBeenCalled()
+        expect(getStatusCode()).toBe(200)
+        expect(getBody()).toEqual({ catalog: [{ id: 'memory', name: 'Memory' }] })
+      })
+    })
+
     describe('Malformed JSON Handling', () => {
       it('returns 400 when body cannot be parsed as JSON', async () => {
         const service = { saveServer: vi.fn() } as unknown as McpServersService
@@ -632,7 +748,7 @@ describe('Mcp Routes & WebServer Registration', () => {
 
       apply(mockContext, { enabled: true })
 
-      expect(registeredRoutes.length).toBe(7)
+      expect(registeredRoutes.length).toBe(12)
       expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/servers')).toBe(true)
       expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/save')).toBe(true)
       expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/approve')).toBe(true)
@@ -640,6 +756,11 @@ describe('Mcp Routes & WebServer Registration', () => {
       expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/probe')).toBe(true)
       expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/presets')).toBe(true)
       expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/presets/install')).toBe(true)
+      expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/toggle')).toBe(true)
+      expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/migrate-scope')).toBe(true)
+      expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/scan-external')).toBe(true)
+      expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/import-external')).toBe(true)
+      expect(registeredRoutes.some((r) => r.path === '/api/dsh-mcp-adapter/catalog')).toBe(true)
     })
 
     it('activates on a Cordis context that throws on undeclared property reads', () => {

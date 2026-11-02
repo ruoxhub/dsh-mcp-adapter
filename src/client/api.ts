@@ -1,4 +1,10 @@
-import type { McpServerDetail, ProbeResult } from '../types.ts'
+import type {
+  ExternalMcpCandidate,
+  ExternalMcpScanResult,
+  McpCatalogEntry,
+  McpServerDetail,
+  ProbeResult,
+} from '../types.ts'
 
 export const API_ROUTES = {
   servers: 'api/dsh-mcp-adapter/servers',
@@ -8,6 +14,11 @@ export const API_ROUTES = {
   probe: 'api/dsh-mcp-adapter/probe',
   presets: 'api/dsh-mcp-adapter/presets',
   installPreset: 'api/dsh-mcp-adapter/presets/install',
+  toggle: 'api/dsh-mcp-adapter/toggle',
+  migrateScope: 'api/dsh-mcp-adapter/migrate-scope',
+  scanExternal: 'api/dsh-mcp-adapter/scan-external',
+  importExternal: 'api/dsh-mcp-adapter/import-external',
+  catalog: 'api/dsh-mcp-adapter/catalog',
 } as const
 
 export class ApiError extends Error {}
@@ -91,5 +102,55 @@ export class McpServersApiClient {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
+  }
+
+  async toggleServer(payload: {
+    name: string
+    scope: string
+    cwd?: string
+    enabled: boolean
+  }): Promise<{ ok: boolean; enabled: boolean }> {
+    return this.request<{ ok: boolean; enabled: boolean }>(API_ROUTES.toggle, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  }
+
+  async migrateScope(payload: {
+    name: string
+    fromScope: string
+    toScope: string
+    cwd?: string
+  }): Promise<{ ok: boolean }> {
+    return this.request<{ ok: boolean }>(API_ROUTES.migrateScope, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  }
+
+  async scanExternal(params?: { cwd?: string }): Promise<ExternalMcpScanResult> {
+    const query = new URLSearchParams()
+    if (params?.cwd) query.set('cwd', params.cwd)
+    const queryString = query.toString()
+    const url = queryString ? `${API_ROUTES.scanExternal}?${queryString}` : API_ROUTES.scanExternal
+    return this.request<ExternalMcpScanResult>(url, { method: 'GET' })
+  }
+
+  async importExternal(payload: {
+    items: ExternalMcpCandidate[]
+    scope: string
+    cwd?: string
+  }): Promise<{ ok: boolean; importedCount: number; errors: string[] }> {
+    return this.request<{ ok: boolean; importedCount: number; errors: string[] }>(API_ROUTES.importExternal, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  }
+
+  async getCatalog(): Promise<{ catalog: McpCatalogEntry[] }> {
+    return this.request<{ catalog: McpCatalogEntry[] }>(API_ROUTES.catalog, { method: 'GET' })
   }
 }

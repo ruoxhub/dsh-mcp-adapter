@@ -3,6 +3,7 @@ import type { McpServersApiClient } from '../api.ts'
 import type { McpPanelController } from '../controller.ts'
 import { ServerEditorTab } from './ServerEditorTab.tsx'
 import { ServersListTab } from './ServersListTab.tsx'
+import { McpMarketPanel } from './McpMarketPanel.tsx'
 import css from './panel.module.css'
 
 export interface McpServersPageProps {
@@ -18,11 +19,13 @@ export function McpServersPage({ controller, api, cwd }: McpServersPageProps): R
     controller.getSnapshot.bind(controller),
   )
 
+  // The market replaces the page; the create/edit sheet floats over the list it was opened from,
+  // so the servers the user was comparing stay visible behind it.
   return (
     <div className={css.pageContainer} data-dsh-plugin="mcp-adapter">
-      {snapshot.viewMode === 'editor' ? (
-        <div data-view="editor" className={css.fullView}>
-          <ServerEditorTab
+      {snapshot.viewMode === 'market' ? (
+        <div data-view="market" className={css.fullView}>
+          <McpMarketPanel
             controller={controller}
             api={api}
             cwd={cwd}
@@ -36,6 +39,13 @@ export function McpServersPage({ controller, api, cwd }: McpServersPageProps): R
             cwd={cwd}
           />
         </div>
+      )}
+      {snapshot.viewMode === 'editor' && (
+        <ServerEditorTab
+          controller={controller}
+          api={api}
+          cwd={cwd}
+        />
       )}
     </div>
   )

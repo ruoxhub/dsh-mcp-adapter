@@ -122,8 +122,9 @@ describe('McpServersPage', () => {
       await Promise.resolve()
     })
 
-    expect(container?.querySelector('[data-view="editor"]')).toBeTruthy()
-    expect(container?.querySelector('[data-breadcrumb-back]')).toBeTruthy()
+    // The sheet floats over the list it was opened from rather than replacing it.
+    expect(container?.querySelector('[role="dialog"]')).toBeTruthy()
+    expect(container?.querySelector('[data-view="list"]')).toBeTruthy()
   })
 })
 

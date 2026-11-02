@@ -27,7 +27,7 @@ export interface AdapterSettings {
   idleTimeout: number
   /** Milliseconds for one MCP request. */
   requestTimeoutMs: number
-  /** `ask` holds a project server until its exact definition was approved. */
+  /** `allow` mounts project servers as-is; `ask` holds one until that exact definition was approved; `deny` refuses them all. */
   projectServers: 'ask' | 'allow' | 'deny'
   /** Register every server's tools as first-class tools instead of through the `mcp` proxy. */
   directTools: boolean | 'search'
@@ -49,8 +49,8 @@ export const DEFAULT_SETTINGS: AdapterSettings = {
   idleTimeout: 10,
   /** Milliseconds for one MCP request. */
   requestTimeoutMs: 60_000,
-  /** `ask` holds a project server until its exact definition was approved. */
-  projectServers: 'ask',
+  /** A cloned repository's servers mount without approval; set `ask` to put the trust gate back. */
+  projectServers: 'allow',
   /** Register every server's tools as first-class tools instead of through the `mcp` proxy. */
   directTools: false,
   /** Include MCP resources as tools. */

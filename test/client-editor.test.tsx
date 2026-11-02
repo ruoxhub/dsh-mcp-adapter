@@ -54,7 +54,7 @@ describe('ServerFormView', () => {
     rawJson: '',
   }
 
-  it('renders stdio form fields with correct placeholders and default values', () => {
+  it('renders the transport picker, name and stdio fields', () => {
     const onChange = vi.fn()
     renderComponent(createElement(ServerFormView, { draft: initialDraft, onChange }))
 
@@ -62,21 +62,18 @@ describe('ServerFormView', () => {
     expect(nameInput).toBeTruthy()
     expect(nameInput.value).toBe('')
 
-    const transportSelect = container?.querySelector('select[data-field="transport"]') as HTMLSelectElement
-    expect(transportSelect).toBeTruthy()
-    expect(transportSelect.value).toBe('stdio')
+    // The transport is two cards, not a select: the choice decides what the rest of the form asks.
+    const stdioCard = container?.querySelector('[data-transport="stdio"]') as HTMLButtonElement
+    expect(stdioCard).toBeTruthy()
+    expect(stdioCard.getAttribute('aria-checked')).toBe('true')
+    const httpCard = container?.querySelector('[data-transport="http"]') as HTMLButtonElement
+    expect(httpCard.getAttribute('aria-checked')).toBe('false')
 
-    const timeoutInput = container?.querySelector('input[data-field="timeoutMs"]') as HTMLInputElement
-    expect(timeoutInput).toBeTruthy()
-    expect(timeoutInput.value).toBe('30000')
-
-    const protocolSelect = container?.querySelector('select[data-field="protocolVersion"]') as HTMLSelectElement
-    expect(protocolSelect).toBeTruthy()
-
-    const commandInput = container?.querySelector('input[placeholder="npx"]') as HTMLInputElement
+    // An empty command is the custom branch, so the text field is the one on screen.
+    const commandInput = container?.querySelector('input[data-field="command"]') as HTMLInputElement
     expect(commandInput).toBeTruthy()
 
-    const argsInput = container?.querySelector('input[placeholder="-y @modelcontextprotocol/server-memory"]') as HTMLInputElement
+    const argsInput = container?.querySelector('input[placeholder="-y @upstash/context7-mcp"]') as HTMLInputElement
     expect(argsInput).toBeTruthy()
   })
 
@@ -90,14 +87,33 @@ describe('ServerFormView', () => {
     })
     expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ name: 'test-server' }))
 
-    const commandInput = container?.querySelector('input[placeholder="npx"]') as HTMLInputElement
+    const commandInput = container?.querySelector('input[data-field="command"]') as HTMLInputElement
     act(() => {
       setInputValue(commandInput, 'node')
     })
     expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ command: 'node' }))
   })
 
-  it('switches between stdio fields and http/sse fields', () => {
+  it('picks npx and uvx from the launcher chips', () => {
+    const onChange = vi.fn()
+    renderComponent(createElement(ServerFormView, { draft: initialDraft, onChange }))
+
+    const npxChip = container?.querySelector('[data-launcher="npx"]') as HTMLButtonElement
+    expect(npxChip).toBeTruthy()
+    act(() => {
+      npxChip.click()
+    })
+    expect(onChange).toHaveBeenCalledWith({ command: 'npx' })
+
+    // A launcher that is neither npx nor uvx drops back to the custom text field.
+    const customDraft: ServerDraft = { ...initialDraft, command: 'node' }
+    renderComponent(createElement(ServerFormView, { draft: customDraft, onChange }))
+    const customChip = container?.querySelector('[data-launcher="custom"]') as HTMLButtonElement
+    expect(customChip.getAttribute('aria-checked')).toBe('true')
+    expect(container?.querySelector('input[data-field="command"]')).toBeTruthy()
+  })
+
+  it('switches between stdio fields and http fields', () => {
     const onChange = vi.fn()
     const httpDraft: ServerDraft = {
       ...initialDraft,
@@ -106,13 +122,19 @@ describe('ServerFormView', () => {
     }
     renderComponent(createElement(ServerFormView, { draft: httpDraft, onChange }))
 
-    expect(container?.querySelector('input[placeholder="npx"]')).toBeNull()
-    const urlInput = container?.querySelector('input[placeholder="http://localhost:3000/sse"]') as HTMLInputElement
+    expect(container?.querySelector('input[data-field="command"]')).toBeNull()
+    const urlInput = container?.querySelector('input[placeholder="https://mcp.example.com/sse"]') as HTMLInputElement
     expect(urlInput).toBeTruthy()
     expect(urlInput.value).toBe('http://localhost:3000/sse')
+
+    const stdioCard = container?.querySelector('[data-transport="stdio"]') as HTMLButtonElement
+    act(() => {
+      stdioCard.click()
+    })
+    expect(onChange).toHaveBeenCalledWith({ transport: 'stdio' })
   })
 
-  it('supports adding and editing headers for http/sse transports', () => {
+  it('supports adding and editing headers for http transports', () => {
     const onChange = vi.fn()
     const httpDraft: ServerDraft = {
       ...initialDraft,
@@ -122,13 +144,7 @@ describe('ServerFormView', () => {
     }
     renderComponent(createElement(ServerFormView, { draft: httpDraft, onChange }))
 
-    const toggleHeaders = container?.querySelector('[data-headers-toggle]') as HTMLButtonElement
-    expect(toggleHeaders).toBeTruthy()
-    act(() => {
-      toggleHeaders.click()
-    })
-
-    const headerKeyInput = (container?.querySelector('input[data-header-key="0"]') || container?.querySelector('input[placeholder="Header Name"]')) as HTMLInputElement
+    const headerKeyInput = container?.querySelector('input[data-header-key="0"]') as HTMLInputElement
     expect(headerKeyInput).toBeTruthy()
     expect(headerKeyInput.value).toBe('Authorization')
 
@@ -138,9 +154,20 @@ describe('ServerFormView', () => {
     expect(onChange).toHaveBeenCalledWith({
       headers: [{ key: 'X-Custom-Auth', value: 'Bearer token' }],
     })
+
+    const addButton = container?.querySelector('[data-add-header]') as HTMLButtonElement
+    act(() => {
+      addButton.click()
+    })
+    expect(onChange).toHaveBeenCalledWith({
+      headers: [
+        { key: 'Authorization', value: 'Bearer token' },
+        { key: '', value: '' },
+      ],
+    })
   })
 
-  it('toggles environment variables accordion and supports adding/removing rows', () => {
+  it('supports adding and removing environment variable rows', () => {
     const onChange = vi.fn()
     const draftWithEnv: ServerDraft = {
       ...initialDraft,
@@ -148,17 +175,9 @@ describe('ServerFormView', () => {
     }
     renderComponent(createElement(ServerFormView, { draft: draftWithEnv, onChange }))
 
-    // Expand accordion if not expanded
-    const toggleButton = container?.querySelector('[data-env-toggle]') as HTMLButtonElement
-    expect(toggleButton).toBeTruthy()
-    act(() => {
-      toggleButton.click()
-    })
-
     const keyInput = container?.querySelector('input[data-env-key="0"]') as HTMLInputElement
     expect(keyInput?.value).toBe('API_KEY')
 
-    // Add env row
     const addButton = container?.querySelector('[data-add-env]') as HTMLButtonElement
     expect(addButton).toBeTruthy()
     act(() => {
@@ -171,13 +190,47 @@ describe('ServerFormView', () => {
       ],
     })
 
-    // Remove env row
     const removeButton = container?.querySelector('[data-remove-env="0"]') as HTMLButtonElement
     expect(removeButton).toBeTruthy()
     act(() => {
       removeButton.click()
     })
     expect(onChange).toHaveBeenCalledWith({ env: [] })
+  })
+
+  it('shows an SSE draft under the HTTP card', () => {
+    const onChange = vi.fn()
+    const sseDraft: ServerDraft = {
+      ...initialDraft,
+      transport: 'sse',
+      url: 'http://localhost:3000/sse',
+    }
+    renderComponent(createElement(ServerFormView, { draft: sseDraft, onChange }))
+
+    // An SSE server is still an HTTP server: neither card may end up unselected.
+    const httpCard = container?.querySelector('[data-transport="http"]') as HTMLButtonElement
+    expect(httpCard.getAttribute('aria-checked')).toBe('true')
+    expect(container?.querySelector('input[placeholder="https://mcp.example.com/sse"]')).toBeTruthy()
+  })
+
+  it('keeps timeout and protocol version behind the advanced disclosure', () => {
+    const onChange = vi.fn()
+    renderComponent(createElement(ServerFormView, { draft: initialDraft, onChange }))
+
+    expect(container?.querySelector('input[data-field="timeoutMs"]')).toBeNull()
+
+    const toggle = container?.querySelector('[data-advanced-toggle]') as HTMLButtonElement
+    expect(toggle).toBeTruthy()
+    act(() => {
+      toggle.click()
+    })
+
+    const timeoutInput = container?.querySelector('input[data-field="timeoutMs"]') as HTMLInputElement
+    expect(timeoutInput).toBeTruthy()
+    expect(timeoutInput.value).toBe('30000')
+
+    const protocolSelect = container?.querySelector('select[data-field="protocolVersion"]') as HTMLSelectElement
+    expect(protocolSelect).toBeTruthy()
   })
 })
 
@@ -242,16 +295,26 @@ describe('ServerEditorTab', () => {
     api = new McpServersApiClient(mockFetch as unknown as typeof fetch)
   })
 
-  it('renders breadcrumb and navigation returns to list', () => {
+  it('renders a sheet whose close button returns to the list', () => {
     renderComponent(createElement(ServerEditorTab, { controller, api }))
 
-    expect(container?.textContent).toContain('MCP 服务器')
     expect(container?.textContent).toContain('新建 MCP 服务器')
+    expect(container?.querySelector('[role="dialog"]')).toBeTruthy()
 
-    const breadcrumbBack = container?.querySelector('[data-breadcrumb-back]') as HTMLElement
-    expect(breadcrumbBack).toBeTruthy()
+    const close = container?.querySelector('[data-sheet-close]') as HTMLElement
+    expect(close).toBeTruthy()
     act(() => {
-      breadcrumbBack.click()
+      close.click()
+    })
+    expect(controller.getSnapshot().viewMode).toBe('list')
+  })
+
+  it('closes on Escape', () => {
+    renderComponent(createElement(ServerEditorTab, { controller, api }))
+    expect(controller.getSnapshot().viewMode).toBe('editor')
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
     })
     expect(controller.getSnapshot().viewMode).toBe('list')
   })
@@ -416,8 +479,9 @@ describe('ServerEditorTab', () => {
     const nameInput = container?.querySelector('input[placeholder="my-mcp-server"]') as HTMLInputElement
     expect(nameInput.value).toBe('existing-server')
     expect(nameInput.disabled).toBe(true)
-    const commandInput = container?.querySelector('input[placeholder="npx"]') as HTMLInputElement
-    expect(commandInput.value).toBe('uvx')
+    // uvx is one of the launcher chips, so the chip carries the state and no text field shows.
+    const uvxChip = container?.querySelector('[data-launcher="uvx"]') as HTMLButtonElement
+    expect(uvxChip.getAttribute('aria-checked')).toBe('true')
   })
 
   it('validates URL in http mode before saving', async () => {

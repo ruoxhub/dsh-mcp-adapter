@@ -90,6 +90,18 @@ function messageOf(error: unknown): string {
   return String(error)
 }
 
+/**
+ * A `projectServers` value that is not one of the three literals: say so, then fail closed.
+ *
+ * Failing closed to `ask` is the point. Widening a typo to the `allow` default would turn a
+ * misspelt "permit" into "run this repository's servers", which is exactly the decision the user
+ * meant to make explicitly.
+ */
+function warnUnknownProjectServers(value: unknown): 'ask' {
+  console.warn(`[dsh-mcp-adapter] projectServers: ${JSON.stringify(value)} is not one of ask | allow | deny — using ask`)
+  return 'ask'
+}
+
 /** Validate the Loader entry. The adapter's own settings file is read separately, per project. */
 export function sanitizeConfig(config: Record<string, unknown> = {}): AdapterConfig {
   const idleTimeout = config.idleTimeout
@@ -108,8 +120,13 @@ export function sanitizeConfig(config: Record<string, unknown> = {}): AdapterCon
     // carries the full settings layer, so the entry states the default `loadConfig` would apply —
     // inert either way, exactly as the source's omission left it.
     requestTimeoutMs: DEFAULT_SETTINGS.requestTimeoutMs,
-    // The source's `['ask', 'allow', 'deny'].includes(...)` test, spelled so the value narrows.
-    projectServers: projectServers === 'ask' || projectServers === 'allow' || projectServers === 'deny' ? projectServers : 'ask',
+    // Unset takes the default; a value that is not one of the three literals is a typo at a trust
+    // boundary, so it fails closed to `ask` instead of silently widening to the `allow` default.
+    projectServers: projectServers === undefined
+      ? DEFAULT_SETTINGS.projectServers
+      : projectServers === 'ask' || projectServers === 'allow' || projectServers === 'deny'
+        ? projectServers
+        : warnUnknownProjectServers(projectServers),
     directTools: config.directTools === true || config.directTools === 'search' ? config.directTools : false,
     // Approval policy: true, "destructive", or a list of tool names.
     approveTools: config.approveTools === true || config.approveTools === 'destructive' || Array.isArray(config.approveTools)
@@ -161,6 +178,7 @@ export function apply(ctx: Context, rawConfig?: Record<string, unknown>): void {
   const registry = ctx.get('workspaceRegistry', false) as WorkspaceRegistrySurface | undefined
   const service = new McpServersService({
     dshHome: settings.dshHome,
+    projectServers: settings.projectServers,
     workspaces: () => listRegisteredWorkspaces(registry),
     onEvictServer: async (name: string) => {
       for (const agent of activeAgents) {
@@ -358,7 +376,7 @@ export function apply(ctx: Context, rawConfig?: Record<string, unknown>): void {
         if (!target) return { kind: 'error', text: 'usage: /mcp-adapter add <presetId>' }
         const preset = getKnownPreset(target)
         if (!preset) return { kind: 'error', text: `Unknown preset "${target}". Run /mcp-adapter presets to view available presets.` }
-        const service = new McpServersService({ dshHome: settings.dshHome })
+        const service = new McpServersService({ dshHome: settings.dshHome, projectServers: settings.projectServers })
         try {
           await service.installPreset({
             presetId: target,

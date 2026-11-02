@@ -242,10 +242,18 @@ function clientConfig(id: string, entry: string, extraPlugins: readonly NonNulla
         this.addWatchFile(physical)
         const source = await readFile(physical)
         const { code, exports: cssExports } = transform({
-          // Repo-relative filename: lightningcss's [hash] placeholder mixes
-          // the filename in, so an absolute path would yield machine-dependent
-          // class names on top of the region-comment noise.
-          filename: fileId,
+          // Plugin id + repo-relative filename. [hash] mixes ONLY this string
+          // into the scoped name, so the filename alone is not enough: every
+          // plugin in the family ships `src/client/panel/panel.module.css`, and
+          // two plugins built from their own repositories then emit the SAME
+          // class names into one document. The later <style> tag wins, so one
+          // plugin's rules silently restyle the other's DOM (dsh-mcp-adapter's
+          // .cardActions inherited dsh-skill-manager's opacity:0 /
+          // pointer-events:none and rendered its action buttons invisible and
+          // unclickable). Prefixing the id makes the namespace per-plugin. Still
+          // repo-relative rather than absolute: an absolute path would yield
+          // machine-dependent class names on top of the region-comment noise.
+          filename: `${id}/${fileId}`,
           code: source,
           cssModules: { pattern: '[hash]_[local]' },
           minify: true,

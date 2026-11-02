@@ -5,6 +5,7 @@ import * as net from 'node:net'
 import { basename, dirname, join, resolve } from 'node:path'
 import {
   adapterHome,
+  DEFAULT_SETTINGS,
   findProjectRoot,
   isDisabledEntry,
   normalizeEntry,
@@ -12,15 +13,37 @@ import {
   resolveDshHome,
   SERVER_NAME_PATTERN,
 } from './config.ts'
-import { getKnownPreset, type KnownServerPreset, listKnownPresets } from './presets.ts'
+import { getKnownPreset, type KnownServerPreset, listKnownPresets, listCatalogEntries } from './presets.ts'
 import { cachePath, purgeCacheEntry } from './cache.ts'
+import { ServerPool } from './servers.ts'
+import { scanExternalMcp } from './imports.ts'
 import { approvalsPath, approve, isApproved, removeApproval } from './trust.ts'
-import type { McpServerDetail, ProbeResult, Scope } from './types.ts'
+import type {
+  ExternalMcpCandidate,
+  ExternalMcpScanResult,
+  McpCatalogEntry,
+  McpServerDetail,
+  ProbeResult,
+  Scope,
+} from './types.ts'
 
-export type { KnownServerPreset, McpServerDetail, ProbeResult, Scope }
+export type {
+  ExternalMcpCandidate,
+  ExternalMcpScanResult,
+  KnownServerPreset,
+  McpCatalogEntry,
+  McpServerDetail,
+  ProbeResult,
+  Scope,
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** `error?.message ?? error`, without reading a property off a primitive. */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function safeReadJson(filePath: string): Record<string, unknown> | null {
@@ -117,7 +140,7 @@ function toServerDetail(
   name: string,
   scope: Scope,
   raw: Record<string, unknown>,
-  ctx: { dshHome: string; projectRoot: string },
+  ctx: { dshHome: string; projectRoot: string; projectServers: 'ask' | 'allow' | 'deny' },
 ): McpServerDetail {
   const category = inferCategory(name, raw)
   const isHttp = Boolean(raw.url ?? raw.serverUrl ?? raw.httpUrl)
@@ -131,9 +154,18 @@ function toServerDetail(
     try {
       const normalized = normalizeEntry(name, raw, { projectRoot: ctx.projectRoot })
       if (!isDisabledEntry(normalized)) {
-        const appPath = approvalsPath(adapterHome(ctx.dshHome))
-        const approved = isApproved(appPath, ctx.projectRoot, name, normalized)
-        status = approved ? 'ready' : 'blocked'
+        // The row reports the gate the session actually applies, so `allow` has to be consulted
+        // here too: reading the approval record alone would label a server "blocked" while the
+        // session mounts and runs it.
+        if (ctx.projectServers === 'allow') {
+          status = 'ready'
+        } else if (ctx.projectServers === 'deny') {
+          status = 'blocked'
+        } else {
+          const appPath = approvalsPath(adapterHome(ctx.dshHome))
+          const approved = isApproved(appPath, ctx.projectRoot, name, normalized)
+          status = approved ? 'ready' : 'blocked'
+        }
       }
     } catch {
       status = 'error'
@@ -185,6 +217,7 @@ function toServerDetail(
     ...(typeof raw.protocolVersion === 'string' ? { protocolVersion: raw.protocolVersion } : {}),
     ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
     status,
+    raw: { ...raw },
   }
 }
 
@@ -196,6 +229,12 @@ export interface WorkspaceOption {
 
 export interface McpServersServiceOptions {
   dshHome?: string
+  /**
+   * The `projectServers` gate the session applies, so a workspace row reports the same verdict the
+   * session reached. Defaulted to the adapter's own default: a panel that guessed a different gate
+   * than the session applied is exactly the "blocked but actually running" lie this field prevents.
+   */
+  projectServers?: 'ask' | 'allow' | 'deny'
   /**
    * Every workspace the host knows (the DSH workspace registry). Optional: a composition without
    * one still gets the active project root as the only entry.
@@ -209,11 +248,13 @@ export interface McpServersServiceOptions {
 
 export class McpServersService {
   private readonly dshHome: string
+  private readonly projectServers: 'ask' | 'allow' | 'deny'
   private readonly registeredWorkspaces?: () => WorkspaceOption[]
   private readonly onEvictServer?: (name: string) => Promise<void> | void
 
   constructor(options?: McpServersServiceOptions) {
     this.dshHome = options?.dshHome ?? resolveDshHome()
+    this.projectServers = options?.projectServers ?? DEFAULT_SETTINGS.projectServers
     this.registeredWorkspaces = options?.workspaces
     this.onEvictServer = options?.onEvictServer
   }
@@ -270,7 +311,7 @@ export class McpServersService {
       if (isRecord(rawServers)) {
         for (const [name, raw] of Object.entries(rawServers)) {
           if (!isRecord(raw)) continue
-          servers.push(toServerDetail(name, 'user', raw, { dshHome: this.dshHome, projectRoot: workspaceRoot }))
+          servers.push(toServerDetail(name, 'user', raw, { dshHome: this.dshHome, projectRoot: workspaceRoot, projectServers: this.projectServers }))
         }
       }
     }
@@ -283,7 +324,7 @@ export class McpServersService {
       if (isRecord(rawServers)) {
         for (const [name, raw] of Object.entries(rawServers)) {
           if (!isRecord(raw)) continue
-          servers.push(toServerDetail(name, 'workspace', raw, { dshHome: this.dshHome, projectRoot: workspaceRoot }))
+          servers.push(toServerDetail(name, 'workspace', raw, { dshHome: this.dshHome, projectRoot: workspaceRoot, projectServers: this.projectServers }))
         }
       }
     }
@@ -469,57 +510,105 @@ export class McpServersService {
   }
 
   /**
+   * Migrate an MCP server between user (global) and workspace scopes atomically.
+   */
+  async migrateScope(options: {
+    name: string
+    fromScope: Scope
+    toScope: Scope
+    cwd?: string
+  }): Promise<{ ok: boolean }> {
+    if (options.fromScope === options.toScope) {
+      return { ok: true }
+    }
+    const effectiveCwd = options.cwd ? resolve(options.cwd) : process.cwd()
+    const workspaceRoot = findProjectRoot(effectiveCwd)
+
+    const fromPath = options.fromScope === 'user'
+      ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
+      : join(workspaceRoot, '.mcp.json')
+
+    const toPath = options.toScope === 'user'
+      ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
+      : join(workspaceRoot, '.mcp.json')
+
+    // 1. Read source
+    const fromData = safeReadJson(fromPath)
+    const fromServers = fromData?.mcpServers ?? fromData?.servers
+    if (!isRecord(fromServers) || !(options.name in fromServers)) {
+      throw new Error(`Server "${options.name}" not found in ${options.fromScope} scope`)
+    }
+    const serverConfig = fromServers[options.name]
+
+    // 2. Check destination collision
+    const toData = safeReadJson(toPath) || { mcpServers: {} }
+    const toServers = toData.mcpServers ?? toData.servers
+    if (isRecord(toServers) && options.name in toServers) {
+      const err: any = new Error(`Server "${options.name}" already exists in ${options.toScope} scope`)
+      err.statusCode = 409
+      throw err
+    }
+
+    // 3. Write destination
+    if (!isRecord(toData.mcpServers)) {
+      toData.mcpServers = {}
+    }
+    ;(toData.mcpServers as Record<string, unknown>)[options.name] = serverConfig
+    safeWriteJson(toPath, toData)
+
+    // 4. Delete from source
+    if (fromData) {
+      if (isRecord(fromData.mcpServers) && options.name in fromData.mcpServers) {
+        delete (fromData.mcpServers as Record<string, unknown>)[options.name]
+      }
+      if (isRecord(fromData.servers) && options.name in fromData.servers) {
+        delete (fromData.servers as Record<string, unknown>)[options.name]
+      }
+      safeWriteJson(fromPath, fromData)
+    }
+
+    // 5. Approvals housekeeping
+    if (options.fromScope === 'workspace') {
+      removeApproval(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, options.name)
+    }
+    if (options.toScope === 'workspace') {
+      try {
+        const normalized = normalizeEntry(options.name, serverConfig, { projectRoot: workspaceRoot })
+        if (!isDisabledEntry(normalized)) {
+          approve(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, options.name, normalized)
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // 6. Invalidate cache and evict running process
+    purgeCacheEntry(cachePath(adapterHome(this.dshHome)), options.name)
+    try {
+      await this.onEvictServer?.(options.name)
+    } catch {
+      // ignore
+    }
+
+    return { ok: true }
+  }
+
+  /**
    * Probe an MCP server endpoint for reachability and latency.
    */
+  /**
+   * Probe an MCP server by starting it and completing the MCP handshake.
+   *
+   * This used to answer `ok: true` for any command that existed on PATH and any URL that returned
+   * HTTP 200, so a random web page and a non-MCP binary both "passed". A probe is only worth a
+   * button if it fails on things that cannot serve MCP, so it now goes through the same
+   * `ServerPool` the Agent uses: spawn, initialize, tools/list, then close. That also honours an
+   * entry's `headers`, `env`, `httpTransport`, `caFile` and `protocolVersion`, which a bare
+   * `fetch(url)` ignored — an authenticated endpoint used to always look broken.
+   */
   async probeServer(server: Record<string, unknown>): Promise<ProbeResult> {
-    const command = Array.isArray(server.command)
-      ? String(server.command[0])
-      : typeof server.command === 'string'
-        ? server.command
-        : undefined
-
-    if (command) {
-      const start = performance.now()
-      const cwd = typeof server.cwd === 'string' ? server.cwd : undefined
-      const found = findExecutable(command, cwd)
-      const latencyMs = Math.round(performance.now() - start)
-      if (found) {
-        return { ok: true, latencyMs }
-      }
-      return { ok: false, latencyMs, error: `Command not found: "${command}"` }
-    }
-
-    const url = typeof server.url === 'string'
-      ? server.url
-      : typeof server.serverUrl === 'string'
-        ? server.serverUrl
-        : typeof server.httpUrl === 'string'
-          ? server.httpUrl
-          : undefined
-
-    if (url) {
-      const timeoutMs = typeof server.timeoutMs === 'number' && server.timeoutMs > 0
-        ? Math.min(server.timeoutMs, 5000)
-        : 5000
-      const start = performance.now()
-      try {
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), timeoutMs)
-        try {
-          await fetch(url, { signal: controller.signal, method: 'GET' })
-        } finally {
-          clearTimeout(timer)
-        }
-        const latencyMs = Math.round(performance.now() - start)
-        return { ok: true, latencyMs }
-      } catch (error: unknown) {
-        const latencyMs = Math.round(performance.now() - start)
-        const message = error instanceof Error ? error.message : String(error)
-        return { ok: false, latencyMs, error: message || 'Connection failed' }
-      }
-    }
-
-    if (typeof server.socket === 'string') {
+    // A socket entry cannot be pooled (`loadConfig` refuses one), so it keeps the raw connect.
+    if (typeof server.socket === 'string' && !server.url && !server.command) {
       const start = performance.now()
       return new Promise<ProbeResult>((probeResolve) => {
         const socket = net.connect(server.socket as string)
@@ -543,9 +632,41 @@ export class McpServersService {
       })
     }
 
-    return { ok: false, error: 'Server configuration must specify command or url' }
-  }
+    const name = typeof server.name === 'string' && server.name.length > 0 ? server.name : 'probe'
+    let config
+    try {
+      config = normalizeEntry(name, server)
+    } catch (error: unknown) {
+      return { ok: false, error: messageOf(error) }
+    }
+    if (isDisabledEntry(config)) {
+      return { ok: false, error: 'Server is disabled' }
+    }
 
+    const pool = new ServerPool({ home: adapterHome(this.dshHome) })
+    const start = performance.now()
+    try {
+      await pool.configure([{ config }])
+      const catalog = await pool.catalog(name, { refresh: true })
+      return {
+        ok: true,
+        latencyMs: Math.round(performance.now() - start),
+        toolCount: catalog.tools.length,
+      }
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        latencyMs: Math.round(performance.now() - start),
+        error: messageOf(error) || 'Handshake failed',
+      }
+    } finally {
+      try {
+        await pool.closeAll()
+      } catch {
+        // A failed close must not turn a completed probe into an error.
+      }
+    }
+  }
   /**
    * List curated MCP server presets.
    */
@@ -592,4 +713,126 @@ export class McpServersService {
       serverName: preset.name,
     }
   }
+
+  /**
+   * Toggle a server between enabled and disabled in-place.
+   */
+  async toggleServer(options: {
+    name: string
+    scope: Scope
+    cwd?: string
+    enabled: boolean
+  }): Promise<{ ok: boolean; enabled: boolean }> {
+    const effectiveCwd = options.cwd ? resolve(options.cwd) : process.cwd()
+    const workspaceRoot = findProjectRoot(effectiveCwd)
+    const targetPath = options.scope === 'user'
+      ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
+      : join(workspaceRoot, '.mcp.json')
+
+    const data = safeReadJson(targetPath)
+    if (!data) {
+      throw new Error(`Configuration file not found at ${targetPath}`)
+    }
+
+    const container = isRecord(data.mcpServers)
+      ? data.mcpServers
+      : isRecord(data.servers)
+        ? data.servers
+        : null
+
+    if (!container || !isRecord(container[options.name])) {
+      throw new Error(`Server "${options.name}" not found in ${options.scope} scope`)
+    }
+
+    const serverDef = container[options.name] as Record<string, unknown>
+    if (options.enabled) {
+      delete serverDef.disabled
+      delete serverDef.enabled
+    } else {
+      serverDef.disabled = true
+      delete serverDef.enabled
+    }
+
+    safeWriteJson(targetPath, data)
+
+    if (!options.enabled) {
+      // Evict running process from pool
+      try {
+        await this.onEvictServer?.(options.name)
+      } catch {
+        // Eviction errors do not fail the toggle
+      }
+    } else {
+      // Invalidate cache
+      purgeCacheEntry(cachePath(adapterHome(this.dshHome)), options.name)
+      if (options.scope === 'workspace') {
+        try {
+          const normalized = normalizeEntry(options.name, serverDef, { projectRoot: workspaceRoot })
+          if (!isDisabledEntry(normalized)) {
+            approve(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, options.name, normalized)
+          }
+        } catch {
+          // Graceful approval
+        }
+      }
+    }
+
+    return { ok: true, enabled: options.enabled }
+  }
+
+  /**
+   * Scan host machine and external AI coding tools for MCP configurations.
+   */
+  scanExternal(options: { cwd?: string } = {}): ExternalMcpScanResult {
+    const effectiveCwd = resolve(options.cwd ?? process.cwd())
+    const workspaceRoot = findProjectRoot(effectiveCwd)
+    return scanExternalMcp({ projectPath: workspaceRoot })
+  }
+
+  /**
+   * Batch import candidates from external tool scan into target scope.
+   */
+  async importExternal(options: {
+    items: ExternalMcpCandidate[]
+    scope: Scope
+    cwd?: string
+  }): Promise<{ ok: boolean; importedCount: number; errors: string[] }> {
+    const errors: string[] = []
+    let importedCount = 0
+
+    for (const item of options.items) {
+      try {
+        const serverDef: Record<string, unknown> = {
+          transport: item.transport,
+          ...(item.command ? { command: item.command } : {}),
+          ...(item.args && item.args.length > 0 ? { args: item.args } : {}),
+          ...(item.url ? { url: item.url } : {}),
+          ...(item.headers && Object.keys(item.headers).length > 0 ? { headers: item.headers } : {}),
+          ...(item.env && Object.keys(item.env).length > 0 ? { env: item.env } : {}),
+          ...(item.description ? { description: item.description } : {}),
+          ...(item.disabled ? { disabled: true } : {}),
+        }
+
+        await this.saveServer({
+          name: item.id,
+          scope: options.scope,
+          cwd: options.cwd,
+          server: serverDef,
+        })
+        importedCount += 1
+      } catch (err: unknown) {
+        errors.push(`Failed to import "${item.id}": ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
+    return { ok: true, importedCount, errors }
+  }
+
+  /**
+   * List curated MCP catalog entries for Market view.
+   */
+  listCatalog(): McpCatalogEntry[] {
+    return listCatalogEntries()
+  }
+
 }

@@ -32,6 +32,24 @@ describe('config', () => {
     expect(DEFAULT_SETTINGS.idleTimeout).toBe(10)
   })
 
+  it('mounts project servers by default, with the trust gate one setting away', () => {
+    // A cloned repository's `.mcp.json` used to wait for a per-definition approval. The default is
+    // now `allow`; `ask` still brings that gate back for anyone who wants it.
+    expect(DEFAULT_SETTINGS.projectServers).toBe('allow')
+    const repo = mkdtempSync(join(tmpdir(), 'mcp-config-'))
+    try {
+      mkdirSync(join(repo, '.git'), { recursive: true })
+      writeFileSync(join(repo, '.mcp.json'), JSON.stringify({ mcpServers: { demo: { command: 'npx' } } }))
+      const home = join(repo, 'home')
+      expect(loadConfig({ cwd: repo, dshHome: home, env: {}, homeDir: home }).settings.projectServers).toBe('allow')
+      mkdirSync(join(home, 'mcp-adapter'), { recursive: true })
+      writeFileSync(join(home, 'mcp-adapter', 'mcp-adapter.json'), JSON.stringify({ settings: { projectServers: 'ask' } }))
+      expect(loadConfig({ cwd: repo, dshHome: home, env: {}, homeDir: home }).settings.projectServers).toBe('ask')
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
   it('finds the nearest ancestor with a .git directory', () => {
     const root = mkdtempSync(join(tmpdir(), 'mcp-config-'))
     try {

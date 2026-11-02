@@ -204,6 +204,14 @@ export interface McpServerDetail {
   protocolVersion?: string
   description?: string
   status?: 'ready' | 'starting' | 'error' | 'blocked' | 'idle'
+  /**
+   * The entry exactly as it sits in the config file, unknown fields included.
+   *
+   * `McpServerDetail` is a normalized view: it drops anything it does not model (`type`,
+   * `caFile`, `httpTransport`, future keys). Copying a server out of the panel has to be lossless,
+   * so the panel reads this instead of rebuilding an approximation.
+   */
+  raw?: Record<string, unknown>
 }
 
 /** Connection probe result for stdio or HTTP MCP endpoints. */
@@ -211,5 +219,84 @@ export interface ProbeResult {
   ok: boolean
   latencyMs?: number
   error?: string
+  /** Tools the server answered tools/list with. Present only after a successful handshake. */
+  toolCount?: number
 }
+
+/** External AI coding tool sources supported for MCP configuration scanning. */
+export type McpSourceKind =
+  | 'claude-desktop'
+  | 'claude-code'
+  | 'cursor-global'
+  | 'cursor-project'
+  | 'codex'
+  | 'vscode'
+  | 'opencode'
+  | 'chatgpt-desktop'
+  | 'agents-servers'
+
+/** One candidate MCP server found in an external tool's config. */
+export interface ExternalMcpCandidate {
+  source: McpSourceKind
+  sourcePath: string
+  id: string
+  rawKey: string
+  label?: string
+  description?: string
+  transport: 'stdio' | 'http' | 'socket'
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  url?: string
+  headers?: Record<string, string>
+  disabled?: boolean
+  warnings?: string[]
+}
+
+/** Report of scan status for a single external source config file/directory. */
+export interface ExternalMcpSourceReport {
+  kind: McpSourceKind
+  path: string
+  exists: boolean
+  error?: string
+  count: number
+}
+
+/** Result of scanning all external tool locations. */
+export interface ExternalMcpScanResult {
+  candidates: ExternalMcpCandidate[]
+  sources: ExternalMcpSourceReport[]
+}
+
+/** High-level categories for curated MCP catalog. */
+export type McpCatalogCategory =
+  | 'devtools'
+  | 'web'
+  | 'docs'
+  | 'data'
+  | 'productivity'
+
+/** A rich curated MCP catalog entry for the Market view. */
+export interface McpCatalogEntry {
+  id: string
+  name: string
+  description: string
+  author?: string
+  homepage?: string
+  categories: McpCatalogCategory[]
+  verified?: boolean
+  transport: 'stdio' | 'http'
+  command?: string
+  args?: string[]
+  url?: string
+  headers?: Record<string, string>
+  env?: Record<string, string>
+  requiredEnv?: Array<{
+    name: string
+    description?: string
+    defaultValue?: string
+  }> | string[]
+  notes?: string
+}
+
 

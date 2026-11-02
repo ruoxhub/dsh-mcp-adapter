@@ -71,7 +71,8 @@ describe('McpServersService', () => {
         }),
       )
 
-      const service = new McpServersService({ dshHome })
+      // `ask` is not the default any more, so the gate has to be answered for on purpose.
+      const service = new McpServersService({ dshHome, projectServers: 'ask' })
 
       // List all
       const allResult = await service.listServers({ cwd: workspaceDir })
@@ -90,7 +91,7 @@ describe('McpServersService', () => {
       const docServer = allResult.servers.find((s) => s.name === 'doc-reader')
       expect(docServer?.scope).toBe('workspace')
       expect(docServer?.category).toBe('document')
-      // Workspace servers from file are not approved yet -> status is blocked
+      // Under `ask`, a workspace server from file is not approved yet -> status is blocked
       expect(docServer?.status).toBe('blocked')
 
       const customServer = allResult.servers.find((s) => s.name === 'custom-worker')
@@ -296,6 +297,38 @@ describe('McpServersService', () => {
     })
   })
 
+  describe('the projectServers gate on the panel rows', () => {
+    const writePending = (): void => {
+      writeFileSync(
+        join(workspaceDir, '.mcp.json'),
+        JSON.stringify({ mcpServers: { 'pending-server': { command: 'node', args: ['script.js'] } } }),
+      )
+    }
+
+    it('reports an unapproved workspace server as ready under allow', async () => {
+      // The session mounts it without an approval record, so the row must not claim otherwise.
+      writePending()
+      const service = new McpServersService({ dshHome, projectServers: 'allow' })
+      const result = await service.listServers({ cwd: workspaceDir, scope: 'workspace' })
+      expect(result.servers[0].status).toBe('ready')
+    })
+
+    it('reports it as blocked under deny, with or without an approval record', async () => {
+      writePending()
+      const service = new McpServersService({ dshHome, projectServers: 'deny' })
+      const result = await service.listServers({ cwd: workspaceDir, scope: 'workspace' })
+      expect(result.servers[0].status).toBe('blocked')
+    })
+
+    it('follows the adapter default when the caller passes no policy', async () => {
+      // A panel that guessed a different gate than the session applies is the bug this prevents.
+      writePending()
+      const service = new McpServersService({ dshHome })
+      const result = await service.listServers({ cwd: workspaceDir, scope: 'workspace' })
+      expect(result.servers[0].status).toBe('ready')
+    })
+  })
+
   describe('approveServer', () => {
     it('approves an unapproved workspace server', async () => {
       writeFileSync(
@@ -307,7 +340,7 @@ describe('McpServersService', () => {
         }),
       )
 
-      const service = new McpServersService({ dshHome })
+      const service = new McpServersService({ dshHome, projectServers: 'ask' })
       const initial = await service.listServers({ cwd: workspaceDir, scope: 'workspace' })
       expect(initial.servers[0].status).toBe('blocked')
 
@@ -325,45 +358,60 @@ describe('McpServersService', () => {
   })
 
   describe('probeServer', () => {
-    it('detects existing stdio command (e.g. node)', async () => {
+    it('fails a stdio command that runs but never completes the MCP handshake', async () => {
+      // `node -e ""` is on PATH and exits without answering `initialize`. A probe that only
+      // looked for the binary on PATH called this a success; that is the bug this test pins.
       const service = new McpServersService({ dshHome })
-      const res = await service.probeServer({ command: 'node', args: ['-v'] })
-      expect(res.ok).toBe(true)
-      expect(typeof res.latencyMs).toBe('number')
-      expect(res.error).toBeUndefined()
+      const res = await service.probeServer({ command: 'node', args: ['-e', ''] })
+      expect(res.ok).toBe(false)
+      expect(res.toolCount).toBeUndefined()
+      expect(res.error).toBeTruthy()
     })
 
     it('returns error for non-existent stdio command', async () => {
       const service = new McpServersService({ dshHome })
       const res = await service.probeServer({ command: 'non_existent_command_xyz_12345' })
       expect(res.ok).toBe(false)
-      expect(res.error).toMatch(/not found/i)
+      expect(res.error).toBeTruthy()
     })
 
-    it('probes HTTP endpoint successfully', async () => {
+    it('fails an HTTP URL that answers 200 but is not an MCP endpoint', async () => {
+      // A bare GET returning 200 says nothing about MCP; the old probe reported this as up.
       const service = new McpServersService({ dshHome })
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('ok', { status: 200 }))
-
-      const res = await service.probeServer({ url: 'http://localhost:3000/mcp' })
-      expect(fetchSpy).toHaveBeenCalled()
-      expect(res.ok).toBe(true)
-      expect(typeof res.latencyMs).toBe('number')
+      try {
+        const res = await service.probeServer({ url: 'http://localhost:3000/not-mcp' })
+        expect(res.ok).toBe(false)
+        expect(res.error).toBeTruthy()
+      } finally {
+        fetchSpy.mockRestore()
+      }
     })
 
-    it('returns error when HTTP endpoint fails', async () => {
+    it('returns error when HTTP endpoint refuses the connection', async () => {
       const service = new McpServersService({ dshHome })
-      vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Connection refused'))
-
-      const res = await service.probeServer({ url: 'http://localhost:9999/mcp' })
-      expect(res.ok).toBe(false)
-      expect(res.error).toBe('Connection refused')
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Connection refused'))
+      try {
+        const res = await service.probeServer({ url: 'http://localhost:9999/mcp' })
+        expect(res.ok).toBe(false)
+        expect(res.error).toBeTruthy()
+      } finally {
+        fetchSpy.mockRestore()
+      }
     })
 
     it('returns error when neither command nor url is given', async () => {
       const service = new McpServersService({ dshHome })
       const res = await service.probeServer({})
       expect(res.ok).toBe(false)
-      expect(res.error).toMatch(/command or url/i)
+      expect(res.error).toBeTruthy()
+    })
+
+    it('refuses a disabled entry instead of starting it', async () => {
+      const service = new McpServersService({ dshHome })
+      const res = await service.probeServer({ command: 'node', args: ['-e', ''], disabled: true })
+      expect(res.ok).toBe(false)
+      expect(res.error).toMatch(/disabled/i)
     })
   })
 

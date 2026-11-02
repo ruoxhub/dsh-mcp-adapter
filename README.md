@@ -18,7 +18,7 @@ dsh 有两个硬约束，这个插件各补一半：
 | 空闲停止 | 默认 10 分钟无调用就停进程（`idleTimeout: 0` 保持到会话结束） |
 | 一个工具代替几百个 | 上下文里只有 `mcp` 一个工具，工具表放在缓存里 |
 | 离线可搜 | 目录缓存在 `mcp-cache.json`，服务器停着也能 `search` / `describe` |
-| 项目信任闸门 | 项目里的服务器按 `projectRoot + serverName + 定义哈希` 批准后才启动；改一个 args 就要重新批准 |
+| 项目信任闸门 | 默认 `projectServers: allow`：项目里的服务器直接挂载。设成 `ask` 则回到按 `projectRoot + serverName + 定义哈希` 批准后才启动，改一个 args 就要重新批准 |
 | 直连工具 | `directTools: true` 或 `["tool_a"]` 把指定工具提成原生工具；`"search"` 则按搜索激活 |
 | MCP 资源 | `mcp({ resources: "<server>" })` 列、`mcp({ server, read: "<uri>" })` 读 |
 | MCP prompts | 每个 prompt 自动变成 `/mcp__<server>__<prompt>` 命令，支持位置参数与 `key=value` |
@@ -68,10 +68,10 @@ src/client/McpPanel.module.css 面板样式（CSS Modules，随 bundle 注入）
 
 ## Web 面板
 
-会话页头多一个 **MCP** 按钮：没批准的项目服务器上会显示 `运行中/总数`，点开是一个只读面板。
+会话页头多一个 **MCP** 按钮，点开是一个只读面板。
 
-- **面板显示什么**：项目根、每个服务器的状态（未启动 / 启动中 / 运行中 / 失败 / 未批准）、工具数（可展开看工具名）、最近错误、配置问题。
-- **批准**：被信任闸门拦住的服务器会单独列在「等待批准」里。面板给两条路——按「批准」会往当前会话发一条普通消息，模型调用 `mcp_approve` 完成批准（批准留在对话记录里，这也是它该有的样子）；或按「复制命令」拿到 `/mcp-adapter approve <name>` 自己敲。
+- **面板显示什么**：项目根、每个服务器的状态（未启动 / 启动中 / 运行中 / 失败 / 未批准）、工具数（可展开看工具名）、最近错误、配置问题。行上的状态跟着 `projectServers` 走：`allow` 下项目服务器直接报「运行中」，`deny` 下报「未批准」。
+- **批准（仅 `ask` 模式）**：默认 `allow` 下没有「等待批准」这一组，也就没有批准动作。设回 `ask` 后，被信任闸门拦住的服务器会单独列在「等待批准」里，面板给两条路——按「批准」会往当前会话发一条普通消息，模型调用 `mcp_approve` 完成批准（批准留在对话记录里，这也是它该有的样子）；或按「复制命令」拿到 `/mcp-adapter approve <name>` 自己敲。
 - **只读**：面板不能改配置、不能启停服务器、不能删批准记录。刷新目录要连服务器，所以仍然只在命令面（`/mcp-adapter tools`）。
 
 为什么是这个形态，而不是一个 `ctx.remote` 命名空间：**第三方插件包无法申报 Remote 命名空间**。浏览器侧的 Remote 只挂 `@deepseek-ai/dsh-api-remotes` 那个包里硬编码的贡献列表（连自带 `./typert` + `./remote` 的 `dsh-client-ui-plugin-manager` 都是靠进这张表才拿到 `remote.pluginManager`），包外没有发现机制。能用的通路只有一条：宿主注册 **session projection**，浏览器通过注入的 `useProjection` 读——这正是 `agentTeam`、`goal`、`modelSelection` 等内置面板走的路。读法是 **key 在前、selector 在后**：`useProjection('mcpAdapter', (value) => value)`，key 选投影、selector 再收窄；只传 selector 会把 key 解析成 `undefined` 并在 `undefined.mcpAdapter` 上抛错。
@@ -87,7 +87,7 @@ src/client/McpPanel.module.css 面板样式（CSS Modules，随 bundle 注入）
   name: dsh-mcp-adapter
   config:
     enabled: true
-    projectServers: ask      # ask | allow | deny
+    projectServers: allow    # allow | ask | deny
     idleTimeout: 10          # 分钟；0 = 会话内不停止
     directTools: false       # false | true | "search"
     approveTools: false      # false | true | "destructive" | ["tool_a"]
@@ -145,7 +145,7 @@ mcp({ describe: "browser_take_screenshot" })  # 看完整参数
 mcp({ tool: "browser_take_screenshot", args: { fullPage: true } })  # 调用；这时才启动
 ```
 
-人侧：`/mcp-adapter status | approve <server> | reload | tools`，或在会话页头的 **MCP** 面板里直接批准。
+人侧：`/mcp-adapter status | approve <server> | reload | tools`。默认 `allow` 下不需要批准；`ask` 模式可在会话页头的 **MCP** 面板里直接批准。
 
 装进 profile（桌面端 profile 被 Electron 独占，走 Web UI 的 Plugins 页）：
 
@@ -157,8 +157,7 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 
 `pnpm test` — 20 个测试文件、372 个自检（vitest），其中端到端那组**真的启动一个 stdio MCP 服务器子进程**：
 
-- 项目服务器被发现，未批准时**完全不会启动**；
-- 批准后第一次取目录才启动，`tools/list` 拿到工具、资源、instructions；
+- 项目服务器默认直接挂载；`ask` 模式下未批准时**完全不会启动**，批准后第一次取目录才启动，`tools/list` 拿到工具、资源、instructions；
 - 停掉服务器后 `search` / `describe` 仍然工作（缓存）；
 - 再次调用会重新拉起进程，返回 `pong`；
 - 空闲清扫只停 lazy 服务器，`keep-alive` 与 `lazy-keep-alive` 不动；
@@ -176,7 +175,7 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 面板部分（`test/panel.test.ts`、`test/client.test.ts`、`test/client-panel.test.tsx`）：
 
 - 快照永远是投影 codec 能解析的纯 JSON；未初始化的会话是「不可用」而不是「空」；
-- 被闸门拦住的服务器一定出现在面板里并带原因；`failed` 算展示但不计入运行中；
+- 被闸门拦住的服务器一定出现在面板里并带原因；`allow` 下同一份配置报「运行中」、`deny` 下报「未批准」（行状态跟着策略走）；`failed` 算展示但不计入运行中；
 - 折叠只认 `mcp-adapter/status`，别的会话事件返回同一引用（零成本）；畸形标记保留上一个值，不会把面板刷白；
 - 发布器只在值真的变化时 append —— 反复打开面板不涨日志；
 - 批准失败会返回带原因的 refused，而不是穿过 Remote 面抛出去，也不会重建会话；
@@ -198,6 +197,7 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 | `mcpScript`（quickjs 沙箱脚本） | 未做 |
 | namespace proxy `mcp__<server>` | 未做（`directTools` 覆盖了这个需求） |
 | unix socket 传输（`socket` 字段） | **不支持**，且在 `loadConfig` 阶段就拒绝并给出原因，不会等到第一次调用才抛错 |
+| `projectServers` 默认 `ask`（项目服务器需批准） | 默认 `allow`，项目服务器直接挂载；`ask` / `deny` 保留为显式选项（见 [ADR-0006](docs/adr/0006-project-server-trust-default-allow.md)） |
 | 从 Cursor/Claude/Codex 导入配置 | **已做**（`importHosts`） |
 | 语义搜索（System One） | 未做，只有词法排序。宿主无 embedding/classifier 服务 |
 | `outputSchema` 校验 | **已做**，由 SDK 完成；热缓存路径会补一次 `tools/list`，否则首调用不校验 |
@@ -206,4 +206,4 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 
 **刻意保留的差异**：`timeoutMs` 与 `transport: "sse"` 只在读取时被接受（*transport alias* —— 非规范拼写，读时兼容、写时永远用规范名），面板写出的永远是 `requestTimeoutMs` / `httpTransport`。
 
-架构决策记在 [docs/adr/](docs/adr/)：0001 是初版权衡（凭据自建、任务不做、静态 preset），0002 记录了宿主能力盘点后把凭据、提问与落盘委托出去，并说明 MCP Tasks 不做是因为 SDK 没有运行时。
+架构决策记在 [docs/adr/](docs/adr/)：0001 是初版权衡（凭据自建、任务不做、静态 preset），0002 记录了宿主能力盘点后把凭据、提问与落盘委托出去，并说明 MCP Tasks 不做是因为 SDK 没有运行时；0003 是变更与驱逐；0004 是对齐 PI-Desktop 的管理架构；0005 是跨作用域迁移与两步武装；0006 是项目信任闸门默认改为 `allow`。

@@ -220,32 +220,3 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 
 真实 `dsh` 引导链路里也验过：冷缓存 → 服务器被拉起 + `tools/list`；热缓存 → **不拉起**。本机 headless 缺 `DEEPSEEK_API_KEY`，所以「模型真正调用 `mcp({tool})`」这一步没跑，其余都跑通了。图片路径同理：已验证「工具结果里有 ImageBlock 且字节过了宿主存储」，但**没有**验证一次真实的多模态请求往返（需要可用的视觉模型）。桌面端窗口不在验证范围，未验证。
 
-## 与 pi-mcp-adapter 的差异（没做的部分）
-
-重写只覆盖行为，不覆盖 Pi 运行时独有的东西。每一行的"未做"都附了原因；宿主侧有能力但本包没接的，标了 `[宿主已有]`：
-
-| pi-mcp-adapter | 这里 |
-|---|---|
-| OAuth 登录、keychain 存 token | **不支持**，且在 `loadConfig` 阶段就拒绝（`oauth` 对象 / `auth: "oauth"`）并给出替代：`headers` / `bearerToken` / `bearerTokenEnv`。`oauth: false` 仍接受。见 [ADR-0011](docs/adr/0011-protocol-completeness-fixes.md) |
-| elicitation | **已做**（form 模式），转接宿主 `ctx.userQuestions`；URL 模式与无提问服务的组合安全降级为拒绝，不死锁。边界仍是宿主的：仅根 agent 可用（子代理收到 `DELEGATED_CALLER`）、无浏览器会话收到 `NO_PROVIDER`，词汇表只有"选项 + 自定义文本" |
-| sampling | 未做。协议侧已废弃（SEP-2577），不建在移除路径上 |
-| MCP Tasks | 未做。**SDK 无运行时**：`@modelcontextprotocol/client@2.2.0` 的全部 task 类型标注 `@deprecated 2025-11-25 wire vocabulary with no SDK runtime`，`Client` 上没有 `getTask`/`cancelTask`/`listTasks` |
-| MCP UI app | 未做 |
-| `mcpScript`（quickjs 沙箱脚本） | 未做 |
-| namespace proxy `mcp__<server>` | 未做（`directTools` 覆盖了这个需求） |
-| unix socket 传输（`socket` 字段） | **不支持**，且在 `loadConfig` 阶段就拒绝并给出原因，不会等到第一次调用才抛错 |
-| `projectServers` 默认 `ask`（项目服务器需批准） | 默认 `allow`，项目服务器直接挂载；`ask` / `deny` 保留为显式选项（见 [ADR-0006](docs/adr/0006-project-server-trust-default-allow.md)） |
-| 从 Cursor/Claude/Codex 导入配置 | **已做**（`importHosts`） |
-| 语义搜索（System One） | 未做，只有词法排序。宿主无 embedding/classifier 服务 |
-| `outputSchema` 校验 | **已做**，由 SDK 完成；热缓存路径会补一次 `tools/list`，否则首调用不校验 |
-| `caFile` 自定义 CA | **已做**，走 Node `https.request` + `ca` 的自定义 `fetch`，不新增依赖 |
-| `protocolVersion` 协商 | **已做**，接到 `ClientOptions.versionNegotiation` |
-| 图片结果（截图、图表） | **已做**：经宿主 `ctx.attachments` 准入后成为真 `ImageBlock`；模型路由不接受图片时降级为带原因的文本。见 [ADR-0011](docs/adr/0011-protocol-completeness-fixes.md) |
-| 运行期清单变化（`list_changed`） | **已做**：`ClientOptions.listChanged` 接住 tools/prompts/resources 三类通知，一次去抖后重读整份目录并落盘 |
-| HTTP 会话过期恢复 | **已做**：持有 `Mcp-Session-Id` 的连接收到 404 时替换连接并重试一次 |
-| 资源模板（`resources/templates/list`） | 未做。参数化资源（`file:///{path}`）对模型不可见；见 ADR-0011 的 Deferred |
-| 目录缓存 TTL | 未做。缓存永不过期，只在定义哈希变化时失效 |
-
-**刻意保留的差异**：`timeoutMs` 与 `transport: "sse"` 只在读取时被接受（*transport alias* —— 非规范拼写，读时兼容、写时永远用规范名），面板写出的永远是 `requestTimeoutMs` / `httpTransport`。超时分两个预算：`requestTimeoutMs`（默认 60s）管握手与目录列举，`executionTimeoutMs`（默认 10 分钟）管一次工具调用/资源读取/提示渲染——一个值同时管两者只能对其中一个是错的。
-
-架构决策记在 [docs/adr/](docs/adr/)：0001 是初版权衡（凭据自建、任务不做、静态 preset），0002 记录了宿主能力盘点后把凭据、提问与落盘委托出去，并说明 MCP Tasks 不做是因为 SDK 没有运行时；0003 是变更与驱逐；0004 是对齐 PI-Desktop 的管理架构；0005 是跨作用域迁移与两步武装；0006 是项目信任闸门默认改为 `allow`；0007 是对齐 PI-Desktop 的 parity 增强；0008 是会话工作区改以宿主当前目录为准；0009 说明服务器运行目录属于会话、不属于定义（含面板信任围栏）；0010 记录目录缓存瘦身与热路径去重（含被否决的共享池 / 自研传输 / 照搬 opencode 清单）；0011 是与 opencode 对比后补齐的五项协议缺陷（失败不落盘、list_changed、OAuth 拒绝与会话恢复、图片准入、超时拆分）及其 Deferred 清单。

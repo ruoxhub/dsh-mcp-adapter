@@ -110,11 +110,6 @@ export interface ProxySession {
   blocked?: Array<{ name: string; reason: string }>
   /** Config problems worth telling the model about. */
   errors?: string[]
-  /**
-   * The execution context of the tool call in flight. `createProxyExecutor` assigns it before any
-   * other member is touched, so approval and the MCP request share one call id and one signal.
-   */
-  execContext?: ToolRunLike
   /** Warm every catalog that is still cold, then return the current one. */
   refreshCatalog: () => Promise<Catalog>
   /** The one gated call path: approval applied, then dispatch. */
@@ -179,9 +174,6 @@ export function createProxyExecutor(
 ): (args: Record<string, unknown>, exec: ToolRunLike | undefined) => Promise<ProxyResult> {
   return async (args = {}, exec) => {
     const session = getSession()
-    // The tool's own execution context carries the call id and cancellation signal; the approval
-    // audit and the MCP request must both be bound to it.
-    if (session !== undefined) session.execContext = exec
     if (session === undefined) return { content: [{ type: 'text', text: 'MCP is not initialized for this session yet.' }] }
 
     if (typeof args.describe === 'string' && args.describe.length > 0) {
@@ -263,7 +255,7 @@ export function createProxyExecutor(
         : typeof args.extract === 'string' && args.extract.trim().length > 0
           ? [args.extract.trim()]
           : undefined
-      return callTool(session, args.tool, normalizeArgs(args.args), args.server, extract)
+      return callTool(session, args.tool, normalizeArgs(args.args), args.server, exec, extract)
     }
 
     await session.refreshCatalog()
@@ -342,7 +334,7 @@ async function spillOversized(session: ProxySession, blocks: ContentBlock[], lab
   }
 }
 
-async function callTool(session: ProxySession, name: string, args: unknown, serverHint: unknown, extract?: string[]): Promise<ProxyResult> {
+async function callTool(session: ProxySession, name: string, args: unknown, serverHint: unknown, exec: ToolRunLike | undefined, extract?: string[]): Promise<ProxyResult> {
   await session.refreshCatalog()
   // The hint is forwarded raw, as the source does: only `undefined` means "no hint", so a
   // JSON-reachable `null`/`0`/`false`/`[]`/`{}` matches no server and the tool is not called.
@@ -354,7 +346,10 @@ async function callTool(session: ProxySession, name: string, args: unknown, serv
   const showStructured = session.appendStructuredContent?.(tool.server) !== false
   try {
     // `callApproved` applies the approval gate, so a proxy call and a direct call cannot diverge.
-    const rawResult = await session.callApproved(tool.name, args, session.execContext)
+    // The execution context arrives as an argument rather than through a field on the session: two
+    // overlapping calls would otherwise bind whichever callId and cancellation signal were assigned
+    // last, so one call's approval could be audited under another's id (ADR-0011).
+    const rawResult = await session.callApproved(tool.name, args, exec)
     if (reportsError(rawResult)) return errorResult(projectResult(rawResult, showStructured))
 
     const result = extract && extract.length > 0 ? extractFields(rawResult, extract) : rawResult

@@ -186,11 +186,6 @@ export class McpSession {
   cache: CatalogCache | undefined
   /** The adapter state directory the cache lives in, recorded by `sync()`. */
   cachePathResolver: string | undefined
-  /**
-   * The execution context of the tool call in flight. `createProxyExecutor` assigns it before any
-   * other member is touched, so approval and the MCP request share one call id and one signal.
-   */
-  execContext: ToolRunLike | undefined
   /** Called after a tool call changed which servers are running; see {@link McpSessionOptions.onStatus}. */
   onStatus: (() => void) | undefined
   /** Registered workspace directories, read live; see {@link McpSessionOptions.workspaces}. */
@@ -212,6 +207,22 @@ export class McpSession {
       cwd: () => this.cwd(),
       logger,
       onCatalog: () => this.invalidateCatalog(),
+      // A live list change has no batched writer behind it (unlike the cold-start read), so this path
+      // persists the new catalog itself; otherwise the next session would restart from the catalog
+      // the server had when it first connected (ADR-0011).
+      onCatalogRefresh: (name, catalog) => {
+        this.invalidateCatalog()
+        const entry = this.pool.get(name)
+        if (entry === undefined || this.cache === undefined) return
+        storeEntry(this.cache, name, entry.config, catalog)
+        this.persistCache([name])
+        // Rebuild now rather than at the next step: direct tools and prompt commands are registered
+        // from the built catalog, so a server that changed its tool set has to re-register them
+        // before the model's next tool list is assembled.
+        void this.rebuildCatalog()
+          .then(() => this.onStatus?.())
+          .catch((error: unknown) => this.logger.warn?.(`mcp-adapter: catalog rebuild after a list change failed: ${messageOf(error)}`))
+      },
       credentials: this.ctx.get?.('credentials', false),
       userQuestions: this.ctx.get?.('userQuestions', false),
       agent,
@@ -716,7 +727,6 @@ export class McpSession {
     this.blocked = []
     this.errors = []
     this.activated.clear()
-    this.execContext = undefined
     this.onStatus = undefined
     this.workspaces = undefined
   }

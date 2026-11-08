@@ -515,24 +515,35 @@ describe('createProxyExecutor mode dispatch', () => {
     expect(out.endsWith('… [output truncated at 65536 bytes]')).toBe(true)
   })
 
-  it('binds execContext before the session is used', async () => {
+  it('hands each call its own execution context instead of a shared session field', async () => {
+    // Two overlapping calls used to race through `session.execContext`: the second assignment
+    // rewrote the first call's callId and cancellation signal, so one call's approval could be
+    // audited under the other's id (ADR-0011).
     const session = fakeSession()
-    const exec = { callId: 'call-order' }
-    let seenDuringRefresh: ToolRunLike | undefined
+    const seen: Array<ToolRunLike | undefined> = []
+    let releaseFirst: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
     const observed: ProxySession = {
       catalog: session.catalog,
       pool: session.pool,
-      refreshCatalog: async () => {
-        seenDuringRefresh = observed.execContext
-        return session.catalog
+      refreshCatalog: async () => session.catalog,
+      callApproved: async (_name, _args, exec) => {
+        seen.push(exec)
+        if (seen.length === 1) await gate
+        return {}
       },
-      callApproved: async () => ({}),
       activateMatches: () => [],
     }
-    await createProxyExecutor(() => observed)({}, exec)
-    // The assignment happens before the first session call, so the catalog refresh already sees it.
-    expect(seenDuringRefresh).toBe(exec)
-    expect(observed.execContext).toBe(exec)
+    const call = createProxyExecutor(() => observed)
+    const first = call({ tool: 'demo_ping' }, { callId: 'call-first' })
+    // The second call starts and finishes while the first is parked inside `callApproved`.
+    const second = call({ tool: 'demo_ping' }, { callId: 'call-second' })
+    releaseFirst?.()
+    await Promise.all([first, second])
+
+    expect(seen.map((exec) => exec?.callId)).toEqual(['call-first', 'call-second'])
   })
 })
 

@@ -1085,3 +1085,75 @@ function handle(message) {
   expect(catalog?.tools).toEqual([])
   expect(catalog?.resources.map((resource) => resource.uri)).toEqual(['demo://only'])
 })
+
+// P0-2 (ADR-0011): a server that changes its tool list while connected must reach the catalog.
+//
+// The pool only ever listed tools at connect time, so a hot-reloaded server's new tools stayed
+// invisible until the idle sweep stopped it and something called again. The server below answers
+// `tools/list` with `before` and then announces `notifications/tools/list_changed`; the catalog must
+// pick up `after` without a reconnect.
+const LIST_CHANGED_SERVER_SOURCE = `
+const LF = String.fromCharCode(10);
+const send = (message) => process.stdout.write(JSON.stringify(message) + LF);
+let buffer = '';
+let listed = 0;
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (let at = buffer.indexOf(LF); at >= 0; at = buffer.indexOf(LF)) {
+    const line = buffer.slice(0, at).trim();
+    buffer = buffer.slice(at + 1);
+    if (line.length > 0) handle(JSON.parse(line));
+  }
+});
+function tool(name) {
+  return { name, description: name, inputSchema: { type: 'object', properties: {} } };
+}
+function handle(message) {
+  if (message.id === undefined) return;
+  const { method, params = {} } = message;
+  if (method === 'initialize') return send({ jsonrpc: '2.0', id: message.id, result: {
+    protocolVersion: params.protocolVersion ?? '2024-11-05',
+    capabilities: { tools: { listChanged: true } },
+    serverInfo: { name: 'live', version: '1.0.0' },
+  } });
+  if (method === 'tools/list') {
+    listed += 1;
+    if (listed === 1) {
+      const result = { tools: [tool('before')] };
+      send({ jsonrpc: '2.0', id: message.id, result });
+      // Announce the change right after the first listing, exactly like a hot reload.
+      setTimeout(() => send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }), 10);
+      return;
+    }
+    return send({ jsonrpc: '2.0', id: message.id, result: { tools: [tool('after')] } });
+  }
+  if (method === 'tools/call') return send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: params.name ?? '' }] } });
+  send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'unknown method ' + method } });
+}
+`
+
+it('a live tools/list_changed notification refreshes the catalog and the disk cache', async () => {
+  const fixes = fixture(LIST_CHANGED_SERVER_SOURCE)
+  writeFileSync(join(fixes.project, '.mcp.json'), JSON.stringify({
+    mcpServers: { live: { command: process.execPath, args: [fixes.server] } },
+  }), 'utf8')
+  const { session } = makeSession(fixes)
+  await session.sync()
+  await session.refreshCatalog()
+  expect(session.pool.get('live')?.catalog?.tools.map((tool) => tool.name)).toEqual(['before'])
+
+  // No reconnect and no second call: only the server's own notification may move the catalog.
+  const deadline = Date.now() + 5_000
+  let names: string[] = []
+  while (Date.now() < deadline) {
+    names = session.pool.get('live')?.catalog?.tools.map((tool) => tool.name) ?? []
+    if (names.includes('after')) break
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  expect(names).toEqual(['after'])
+
+  // The refreshed catalog is what the next process starts from, not the one from connect time.
+  const cacheFile = join(loadConfig({ cwd: fixes.project, dshHome: fixes.home }).home, 'mcp-cache.json')
+  expect(loadCache(cacheFile).servers.live?.tools.map((tool) => tool.name)).toEqual(['after'])
+})

@@ -20,6 +20,8 @@ import { withTimeout } from './util.ts'
 export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000
 export const RECONNECT_BASE_MS = 500
 export const RECONNECT_MAX_MS = 30_000
+/** How long a burst of list-changed notifications is coalesced before one catalog read. */
+export const LIST_CHANGED_DEBOUNCE_MS = 100
 
 /**
  * The logger surface this module ducks. Every call site stays optional: a caller that passes
@@ -76,6 +78,8 @@ export interface PoolEntry {
   recentStderr?: string[]
   /** The effective catalog, live or restored from cache; it outlives the connection. */
   catalog?: ServerCatalog
+  /** Coalesces a burst of list-changed notifications into one catalog read. */
+  changeTimer?: ReturnType<typeof setTimeout>
 }
 
 /** One row of `status()`, which is what the proxy tool and the panel read. */
@@ -103,6 +107,14 @@ export interface ServerPoolOptions {
    */
   cwd?: () => string | undefined
   onCatalog?: (name: string, catalog: ServerCatalog) => void
+  /**
+   * A live server announced a list change and its catalog was re-read.
+   *
+   * Separate from {@link ServerPoolOptions.onCatalog} because the two happen on different paths: the
+   * cold-start read is followed by the session's own batched cache write (ADR-0010), while this one
+   * has no such owner and must persist itself or the change dies with the process.
+   */
+  onCatalogRefresh?: (name: string, catalog: ServerCatalog) => void
   onStatus?: (name: string) => void
   logger?: Logger
   settings?: Partial<AdapterSettings>
@@ -202,12 +214,25 @@ function httpTransport(config: ServerConfig, baseUrl: URL, overrideBearerToken?:
  * the plain legacy handshake, a concrete version pins it. Anything else stays on the SDK default
  * (`'legacy'`), which is what a server that never mentioned the field should get.
  */
-function clientOptions(config: ServerConfig, userQuestions?: UserQuestionsLike): ClientOptions {
+function clientOptions(
+  config: ServerConfig,
+  userQuestions?: UserQuestionsLike,
+  onListChanged?: () => void,
+): ClientOptions {
   const options: ClientOptions = {
     capabilities: {
       ...(config.roots !== false ? { roots: {} } : {}),
       ...(userQuestions ? { elicitation: { form: {} } } : {}),
     },
+  }
+  // A server that adds or removes tools while connected announces it; without these handlers the
+  // catalog stayed whatever `tools/list` said at connect time, so a hot-reloaded server's new tools
+  // were invisible until the idle sweep stopped it (ADR-0011). `autoRefresh: false` because one
+  // notification is answered by one full catalog read (tools, resources, prompts) rather than by
+  // three separate re-listings the SDK would otherwise run itself.
+  if (onListChanged !== undefined) {
+    const changed = { autoRefresh: false, debounceMs: 100, onChanged: () => onListChanged() }
+    options.listChanged = { tools: changed, prompts: changed, resources: changed }
   }
   const wanted = config.protocolVersion
   if (wanted === 'auto') options.versionNegotiation = { mode: 'auto' }
@@ -277,6 +302,7 @@ export class ServerPool {
   home: string
   settings: Partial<AdapterSettings>
   onCatalog: ((name: string, catalog: ServerCatalog) => void) | undefined
+  onCatalogRefresh: ((name: string, catalog: ServerCatalog) => void) | undefined
   onStatus: ((name: string) => void) | undefined
   logger: Logger | undefined
   credentials: unknown
@@ -287,11 +313,12 @@ export class ServerPool {
   /** name -> { config, connection?, connecting?, reconnectAttempts, timer, state, lastError } */
   servers: Map<string, PoolEntry>
 
-  constructor({ home, cwd, onCatalog, onStatus, logger, settings, credentials, userQuestions, agent }: ServerPoolOptions) {
+  constructor({ home, cwd, onCatalog, onCatalogRefresh, onStatus, logger, settings, credentials, userQuestions, agent }: ServerPoolOptions) {
     this.home = home
     this.cwdOf = cwd
     this.settings = settings ?? {}
     this.onCatalog = onCatalog
+    this.onCatalogRefresh = onCatalogRefresh
     this.onStatus = onStatus
     this.logger = logger
     this.credentials = credentials
@@ -370,7 +397,15 @@ export class ServerPool {
     const config = entry.config
     entry.state = 'connecting'
     const timeoutMs = this.timeoutFor(entry)
-    const client = new Client({ name: 'dsh-mcp-adapter', version: '0.1.0' }, clientOptions(config, this.userQuestions))
+    // Assigned once the connection exists: a notification from a connection that has already been
+    // replaced must not rewrite the catalog of the one that replaced it.
+    let live: Connection | undefined
+    const client = new Client(
+      { name: 'dsh-mcp-adapter', version: '0.1.0' },
+      clientOptions(config, this.userQuestions, () => {
+        if (live !== undefined && entry.connection === live) this.scheduleCatalogRefresh(name, entry)
+      }),
+    )
     if (config.roots !== false) {
       // The root a server is told is the directory it runs in, so a tool that resolves a relative
       // path and the process itself agree. With no known directory (a session that records none)
@@ -446,6 +481,7 @@ export class ServerPool {
     const connection = new Connection(client, transport, async () => {
       await this.safeClose(client, transport)
     })
+    live = connection
     entry.connection = connection
     entry.state = 'connected'
     entry.lastError = undefined
@@ -463,8 +499,50 @@ export class ServerPool {
     } catch {
       // Older SDK clients may not expose onclose; the next call reconnects anyway.
     }
+    // Background transport failures (a dropped SSE stream, a rejected frame) are reported only here.
+    // Without this the pool kept advertising `connected` while every later request failed.
+    client.onerror = (error: Error) => {
+      if (entry.connection !== connection) return
+      entry.lastError = messageOf(error)
+      this.logger?.debug?.(`mcp-adapter: ${name} transport error: ${entry.lastError}`)
+    }
     this.onStatus?.(name)
     return connection
+  }
+
+  /**
+   * Coalesce a burst of list-changed notifications into one catalog read.
+   *
+   * A server that adds several tools announces each as its own notification, and the SDK hands over
+   * three independent `listChanged` subscriptions (tools, prompts, resources); re-reading the whole
+   * catalog per notification would fan a startup burst out into dozens of `tools/list` round trips.
+   * The read itself is deliberately not awaited: a notification arrives on the SDK's own dispatch
+   * path, where a rejection has nowhere to go.
+   */
+  private scheduleCatalogRefresh(name: string, entry: PoolEntry): void {
+    if (entry.changeTimer !== undefined) clearTimeout(entry.changeTimer)
+    entry.changeTimer = setTimeout(() => {
+      entry.changeTimer = undefined
+      const connection = entry.connection
+      if (connection === undefined) return
+      void this.fetchCatalog(name, entry, connection)
+        .then((catalog) => {
+          if (entry.connection !== connection) return
+          entry.catalog = catalog
+          connection.catalog = catalog
+          this.onCatalog?.(name, catalog)
+          this.onCatalogRefresh?.(name, catalog)
+          this.onStatus?.(name)
+        })
+        .catch((error: unknown) => {
+          // A refresh that fails leaves the previous catalog in place; the failure is visible in the
+          // panel rather than silently replacing real tools with nothing (ADR-0011, P0-1).
+          entry.lastError = messageOf(error)
+          this.logger?.debug?.(`mcp-adapter: ${name} catalog refresh failed: ${entry.lastError}`)
+          this.onStatus?.(name)
+        })
+    }, LIST_CHANGED_DEBOUNCE_MS)
+    entry.changeTimer.unref?.()
   }
 
   async safeClose(client: Client | undefined, transport: Transport | undefined): Promise<void> {
@@ -487,6 +565,12 @@ export class ServerPool {
     if (entry.timer !== undefined) {
       clearTimeout(entry.timer)
       entry.timer = undefined
+    }
+    // A pending catalog refresh belongs to the connection being closed; letting it fire would
+    // reopen a server the idle sweep just stopped.
+    if (entry.changeTimer !== undefined) {
+      clearTimeout(entry.changeTimer)
+      entry.changeTimer = undefined
     }
     const connection = entry.connection
     entry.connection = undefined
@@ -516,6 +600,7 @@ export class ServerPool {
       entry.recentStderr = undefined
       entry.connecting = undefined
       entry.lastError = undefined
+      entry.changeTimer = undefined
     }
     this.servers.clear()
   }

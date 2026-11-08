@@ -4,7 +4,7 @@ import { clientBundle } from './shared/tsdown.client.ts'
 // package is published from its own repository, where `../../shared` does not exist. Same rule the
 // other plugin repositories in the family follow.
 
-export default clientBundle('dsh-mcp-adapter', ['src/index.ts'], {
+export default clientBundle('@ruoxhub/dsh-mcp-adapter', ['src/index.ts'], {
   libExternal: [
     '@deepseek-ai/dsh-client-locale',
     '@deepseek-ai/dsh-client-ui-slots',

@@ -1,8 +1,15 @@
 {
-  "name": "dsh-mcp-adapter",
-  "version": "0.1.1",
-  "private": true,
+  "name": "@ruoxhub/dsh-mcp-adapter",
+  "version": "0.1.0",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruoxhub/dsh-mcp-adapter.git"
+  },
+  "homepage": "https://github.com/ruoxhub/dsh-mcp-adapter#readme",
+  "bugs": {
+    "url": "https://github.com/ruoxhub/dsh-mcp-adapter/issues"
+  },
   "description": "pi-mcp-adapter's behavior for DeepSeek Harness, written natively: project-level MCP config, lazy servers that stop when idle, one mcp proxy tool over a cached catalog, direct tools, and a project-server trust gate.",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

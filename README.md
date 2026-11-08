@@ -34,11 +34,15 @@ dsh 有两个硬约束，这个插件各补一半：
 | 工具过滤与审批 Glob | `includeTools`、`excludeTools`、`approveTools`、`autoApprove` 支持 `*`、`?` 通配符与 `server_*` 前缀匹配 |
 | 宿主凭证集成 | 自动桥接宿主 `ctx.credentials` 服务，优先解析动态 grant 令牌，无缝回退静态 `bearerToken` |
 | 宿主提问与 Elicitation | 将 MCP `elicitation/create` 转接至宿主 `ctx.userQuestions`；在无交互/无头环境中安全降级拒绝，杜绝死锁；工具调用期间支持计时器挂起 |
+| 图片结果 | 服务器返回的图片经宿主 `ctx.attachments` 准入后成为真 `ImageBlock`（截图、图表不再变成占位符）；模型路由不接受图片时降级为带原因的文本 |
+| 运行期清单变化 | 服务器增删工具/资源/提示时按 `list_changed` 通知重读目录并落盘，不用等下一次调用或重连 |
+| HTTP 会话过期恢复 | 持有 `Mcp-Session-Id` 的连接被服务端遗忘（404）时换连接重试一次，而不是永久报 `connected` |
+| 服务器 instructions 进系统提示 | 自动注入 `<mcp_instructions>` 块（单台 4KB、全会话 32KB 上限），模型不用主动来问 |
 | 会话页头面板 | 一个 MCP 按钮：各服务器状态与工具数、配置问题、被拦服务器的原因；面板内可批准 |
 
 ## 代码结构
 
-宿主侧（Node half，23 个模块）：
+宿主侧（Node half，27 个模块）：
 
 ```
 src/index.ts                  插件入口：按 agent 建会话、注册 mcp 工具与命令、空闲清扫、配置热更新
@@ -56,6 +60,7 @@ src/imports.ts                收养 Cursor/Claude Code/VS Code/Codex 的全局 
 src/request-headers-command.ts requestHeadersCommand 动态命令执行与 fetch 请求包装
 src/credentials.ts            宿主 ctx.credentials 令牌解析桥接
 src/elicitation.ts            MCP Elicitation 协议转接 ctx.userQuestions、防死锁回退与超时挂起
+src/media.ts                  MCP 图片结果 → 宿主 ctx.attachments 准入 → ImageBlock（拒绝时降级为诊断文本）
 src/testserver.ts             迁移期新增的两个用例驱动的扩展 stdio MCP 服务器（工具/资源/prompt/危险工具）
 src/util.ts                   超时、abort 组合、结果投影、输出截断
 src/status.ts                 Web 面板的快照（纯函数，可直接测）
@@ -63,7 +68,10 @@ src/projection.ts             Web 面板读的 mcpAdapter 投影 + 发布器
 src/approve.ts                Web 面板「批准」按钮驱动的 mcp_approve 工具
 src/routes.ts                面板 REST 路由（每个都过信任围栏）
 src/request-trust.ts         面板路由的浏览器信任围栏（Host / Origin / Sec-Fetch-Site）
-src/types.ts                  跨模块接口（纯声明，不 import 任何模块）
+src/types.ts                  跨模块接口（除一个 ContentBlock 类型别名外不 import 任何模块）
+src/service.ts               面板/路由共用服务：服务器 CRUD、作用域迁移、探测、导入、预置
+src/presets.ts               内置服务器预置与精选 Market 目录
+src/tls-fetch.ts             自定义 CA 的 https fetch（caFile 用）
 ```
 
 浏览器侧（client half，4 个文件）：
@@ -123,7 +131,7 @@ src/client/McpPanel.module.css 面板样式（CSS Modules，随 bundle 注入）
 }
 ```
 
-服务器级字段：`command`/`args`/`env`/`cwd`/`inheritEnv`、`url`/`headers`、`httpTransport`（`sse` = 旧式 SSE，默认 Streamable HTTP）、`caFile`、`protocolVersion`（`legacy`（默认）/`auto`/具体版本号）、`lifecycle`（`lazy`/`keep-alive`/`lazy-keep-alive`/`eager`）、`idleTimeout`、`requestTimeoutMs`、`directTools`、`includeTools`/`excludeTools`、`searchKeywords`、`toolPrefix`、`description`、`appendStructuredContent`、`autoApprove`、`approveTools`、`debug`。
+服务器级字段：`command`/`args`/`env`/`cwd`/`inheritEnv`、`url`/`headers`、`httpTransport`（`sse` = 旧式 SSE，默认 Streamable HTTP）、`caFile`、`protocolVersion`（`legacy`（默认）/`auto`/具体版本号）、`lifecycle`（`lazy`/`keep-alive`/`lazy-keep-alive`/`eager`）、`idleTimeout`、`requestTimeoutMs`（握手与目录列举）、`executionTimeoutMs`（一次工具调用/资源读取/提示渲染，默认 10 分钟）、`directTools`、`includeTools`/`excludeTools`、`searchKeywords`、`toolPrefix`、`description`、`appendStructuredContent`、`autoApprove`、`approveTools`、`debug`。
 
 四个 `lifecycle` 的实际差别（以前的 `eager` 与 `lazy-keep-alive` 是空实现，现已接线）：
 
@@ -134,7 +142,7 @@ src/client/McpPanel.module.css 面板样式（CSS Modules，随 bundle 注入）
 | `keep-alive` | 启动 | 不停止 | 自动重连 |
 | `eager` | 启动 | 不停止（除非该服务器自己写了 `idleTimeout`） | 等下次调用 |
 
-**只读时接受的别名**：`timeoutMs` → `requestTimeoutMs`，`transport: "sse"` → `httpTransport: "sse"`。写入永远用规范名——面板已经改成写规范名，因为旧拼写写出的是一批没人消费的键。
+**只读时接受的别名**：`timeoutMs` → `requestTimeoutMs`，`transport: "sse"` → `httpTransport: "sse"`。写入永远用规范名——面板已经改成写规范名，因为旧拼写写出的是一批没人消费的键。`timeoutMs` 只映射到 `requestTimeoutMs`，不会顺带放大 `executionTimeoutMs`。
 
 **两种审批写法方向相反，不会互相覆盖：**
 
@@ -169,7 +177,7 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 
 ## 验证
 
-`pnpm test` — 29 个测试文件、462 个自检（vitest），其中端到端那组**真的启动一个 stdio MCP 服务器子进程**：
+`pnpm test` — 30 个测试文件、484 个自检（vitest），其中端到端那组**真的启动一个 stdio MCP 服务器子进程**：
 
 - 项目服务器默认直接挂载；`ask` 模式下未批准时**完全不会启动**，批准后第一次取目录才启动，`tools/list` 拿到工具、资源、instructions；
 - 停掉服务器后 `search` / `describe` 仍然工作（缓存）；
@@ -190,6 +198,13 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 - **workspace 写入必须带目录**：面板 `save`/`approve`/`delete` 缺目录时 400 且磁盘上不产生文件；
 - **服务器目录不参与定义身份**：同一份定义在两个会话目录下连接时缓存条目仍命中，而子进程的 `cwd` 分别落在两个目录（ADR-0009）；
 - **相对 `cwd` 相对会话目录解析**：写 `"./servers"` 的条目实际在该子目录里 spawn，而不是被静默丢弃后在项目根跑；
+- **失败的 `tools/list` 不落盘**（ADR-0011 P0-1）：一个第一次列工具就返回 `-32603` 的服务器，目录**不写进** `mcp-cache.json`、池里也**不留** `catalog`，第二次读取重试后拿到工具；另有一台只提供资源的服务器证明「没有 tools 能力」仍然是合法的空目录（守卫按「记录了失败」而非「列表为空」判定）；
+- **运行期清单变化会跟上**（P0-2）：服务器连上后主动发 `notifications/tools/list_changed`，目录从 `before` 变成 `after`，且新目录被写进磁盘缓存——不重连、不靠下一次调用；
+- **HTTP 会话过期会恢复**（P1-3）：一个在 `initialize` 后吊销 `Mcp-Session-Id` 的服务器，下一次工具调用自动换连接重试一次并成功；
+- **`oauth` 在加载期被拒绝**（P1-3）：`oauth: {}` 与 `auth: "oauth"` 两个条目都不挂载并给出可操作原因，`oauth: false` 与 `headers` 条目照常挂载；
+- **图片真的到模型**（P1-4）：真 stdio 服务器返回 image 内容，经真 `ToolRuntime` 断言结果里有 image 块而不是占位文本，且字节确实过了宿主 `saveImages`；模型路由不声明图片输入时降级为带原因的文本；
+- **两个超时预算各自生效**（P1-5）：`requestTimeoutMs` 卡住一个永不应答的 `tools/list`，`executionTimeoutMs` 卡住一个永不应答的工具调用，互不干扰；
+- **服务器 instructions 进系统提示**（P2-7）：`summary()` 输出 `<mcp_instructions>` 块并缩进；超过单台上限被截断、超过总会话预算的服务器按名字报告；
 - **面板围栏拒绝四种外来请求**：DNS rebinding（外来 `Host`）、`Sec-Fetch-Site: cross-site`、外来 `Origin`、无 `Host`——都返回 403 且不触达 handler。
 - **目录瘦身（ADR-0010）**：一个 600KB 的 `outputSchema` 不会被写进缓存（写入边界就投影成 `hasOutputSchema` 布尔）；构建目录时预计算小写搜索字段，手搓目录惰性派生；
 - **一次冷启动只写一次盘（ADR-0010）**：两台冷服务器不再各写一次全文件；`persistCache` 读-合并-写保留其他会话的条目，被面板 purge 的名字不会被旧快照复活；默认无直连工具时 `mcp({search})` 不再做第二次全量排序。
@@ -203,7 +218,7 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 - 批准失败会返回带原因的 refused，而不是穿过 Remote 面抛出去，也不会重建会话；
 - 浏览器 bundle 用假 loader 真实加载一遍：声明的 id、导出的 `apply`/`inject`、`./client` 导出、两份字典键完全一致（缺键会在 UI 里显示成裸 key）。
 
-真实 `dsh` 引导链路里也验过：冷缓存 → 服务器被拉起 + `tools/list`；热缓存 → **不拉起**。本机 headless 缺 `DEEPSEEK_API_KEY`，所以「模型真正调用 `mcp({tool})`」这一步没跑，其余都跑通了。
+真实 `dsh` 引导链路里也验过：冷缓存 → 服务器被拉起 + `tools/list`；热缓存 → **不拉起**。本机 headless 缺 `DEEPSEEK_API_KEY`，所以「模型真正调用 `mcp({tool})`」这一步没跑，其余都跑通了。图片路径同理：已验证「工具结果里有 ImageBlock 且字节过了宿主存储」，但**没有**验证一次真实的多模态请求往返（需要可用的视觉模型）。桌面端窗口不在验证范围，未验证。
 
 ## 与 pi-mcp-adapter 的差异（没做的部分）
 
@@ -211,8 +226,8 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 
 | pi-mcp-adapter | 这里 |
 |---|---|
-| OAuth 登录、keychain 存 token | 未做。`bearerToken` / `bearerTokenEnv` / `headers` 可用；未来令牌应存 `ctx.credentials`（[宿主已有]，见 ADR-0002） |
-| elicitation | 未做。[宿主已有] `ctx.userQuestions`，但仅根 agent 可用：子代理会收到 `DELEGATED_CALLER`、无浏览器会话收到 `NO_PROVIDER`，且词汇表只有"选项 + 自定义文本" |
+| OAuth 登录、keychain 存 token | **不支持**，且在 `loadConfig` 阶段就拒绝（`oauth` 对象 / `auth: "oauth"`）并给出替代：`headers` / `bearerToken` / `bearerTokenEnv`。`oauth: false` 仍接受。见 [ADR-0011](docs/adr/0011-protocol-completeness-fixes.md) |
+| elicitation | **已做**（form 模式），转接宿主 `ctx.userQuestions`；URL 模式与无提问服务的组合安全降级为拒绝，不死锁。边界仍是宿主的：仅根 agent 可用（子代理收到 `DELEGATED_CALLER`）、无浏览器会话收到 `NO_PROVIDER`，词汇表只有"选项 + 自定义文本" |
 | sampling | 未做。协议侧已废弃（SEP-2577），不建在移除路径上 |
 | MCP Tasks | 未做。**SDK 无运行时**：`@modelcontextprotocol/client@2.2.0` 的全部 task 类型标注 `@deprecated 2025-11-25 wire vocabulary with no SDK runtime`，`Client` 上没有 `getTask`/`cancelTask`/`listTasks` |
 | MCP UI app | 未做 |
@@ -225,7 +240,12 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 | `outputSchema` 校验 | **已做**，由 SDK 完成；热缓存路径会补一次 `tools/list`，否则首调用不校验 |
 | `caFile` 自定义 CA | **已做**，走 Node `https.request` + `ca` 的自定义 `fetch`，不新增依赖 |
 | `protocolVersion` 协商 | **已做**，接到 `ClientOptions.versionNegotiation` |
+| 图片结果（截图、图表） | **已做**：经宿主 `ctx.attachments` 准入后成为真 `ImageBlock`；模型路由不接受图片时降级为带原因的文本。见 [ADR-0011](docs/adr/0011-protocol-completeness-fixes.md) |
+| 运行期清单变化（`list_changed`） | **已做**：`ClientOptions.listChanged` 接住 tools/prompts/resources 三类通知，一次去抖后重读整份目录并落盘 |
+| HTTP 会话过期恢复 | **已做**：持有 `Mcp-Session-Id` 的连接收到 404 时替换连接并重试一次 |
+| 资源模板（`resources/templates/list`） | 未做。参数化资源（`file:///{path}`）对模型不可见；见 ADR-0011 的 Deferred |
+| 目录缓存 TTL | 未做。缓存永不过期，只在定义哈希变化时失效 |
 
-**刻意保留的差异**：`timeoutMs` 与 `transport: "sse"` 只在读取时被接受（*transport alias* —— 非规范拼写，读时兼容、写时永远用规范名），面板写出的永远是 `requestTimeoutMs` / `httpTransport`。
+**刻意保留的差异**：`timeoutMs` 与 `transport: "sse"` 只在读取时被接受（*transport alias* —— 非规范拼写，读时兼容、写时永远用规范名），面板写出的永远是 `requestTimeoutMs` / `httpTransport`。超时分两个预算：`requestTimeoutMs`（默认 60s）管握手与目录列举，`executionTimeoutMs`（默认 10 分钟）管一次工具调用/资源读取/提示渲染——一个值同时管两者只能对其中一个是错的。
 
-架构决策记在 [docs/adr/](docs/adr/)：0001 是初版权衡（凭据自建、任务不做、静态 preset），0002 记录了宿主能力盘点后把凭据、提问与落盘委托出去，并说明 MCP Tasks 不做是因为 SDK 没有运行时；0003 是变更与驱逐；0004 是对齐 PI-Desktop 的管理架构；0005 是跨作用域迁移与两步武装；0006 是项目信任闸门默认改为 `allow`；0007 是对齐 PI-Desktop 的 parity 增强；0008 是会话工作区改以宿主当前目录为准；0009 说明服务器运行目录属于会话、不属于定义（含面板信任围栏）；0010 记录目录缓存瘦身与热路径去重（含被否决的共享池 / 自研传输 / 照搬 opencode 清单）。
+架构决策记在 [docs/adr/](docs/adr/)：0001 是初版权衡（凭据自建、任务不做、静态 preset），0002 记录了宿主能力盘点后把凭据、提问与落盘委托出去，并说明 MCP Tasks 不做是因为 SDK 没有运行时；0003 是变更与驱逐；0004 是对齐 PI-Desktop 的管理架构；0005 是跨作用域迁移与两步武装；0006 是项目信任闸门默认改为 `allow`；0007 是对齐 PI-Desktop 的 parity 增强；0008 是会话工作区改以宿主当前目录为准；0009 说明服务器运行目录属于会话、不属于定义（含面板信任围栏）；0010 记录目录缓存瘦身与热路径去重（含被否决的共享池 / 自研传输 / 照搬 opencode 清单）；0011 是与 opencode 对比后补齐的五项协议缺陷（失败不落盘、list_changed、OAuth 拒绝与会话恢复、图片准入、超时拆分）及其 Deferred 清单。

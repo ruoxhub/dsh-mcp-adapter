@@ -1157,3 +1157,91 @@ it('a live tools/list_changed notification refreshes the catalog and the disk ca
   const cacheFile = join(loadConfig({ cwd: fixes.project, dshHome: fixes.home }).home, 'mcp-cache.json')
   expect(loadCache(cacheFile).servers.live?.tools.map((tool) => tool.name)).toEqual(['after'])
 })
+
+// P1-3 (ADR-0011): a legacy Streamable HTTP session the server forgot must be replaced, not reused.
+//
+// The server mints an `Mcp-Session-Id` on initialize and answers every later POST with 404. The
+// transport reports that as an `SdkHttpError` and never fires `onclose`, so before this fix the pool
+// kept the dead connection, reported `connected`, and every call failed the same way forever.
+it('reconnects once when a legacy HTTP session expires and retries the call', async () => {
+  const { createServer } = await import('node:http')
+  // Sessions the server still honors. Every initialize mints one; the first tool call revokes it,
+  // which is what a server restart looks like to a client holding an `Mcp-Session-Id`.
+  const live = new Set<string>()
+  let minted = 0
+  let calls = 0
+  const server = createServer((request, response) => {
+    let body = ''
+    request.on('data', (chunk) => {
+      body += chunk
+    })
+    request.on('end', () => {
+      const message: { id?: unknown; method?: string } = body.length > 0 ? JSON.parse(body) : {}
+      if (message.id === undefined) {
+        response.writeHead(202)
+        response.end()
+        return
+      }
+      const sessionId = request.headers['mcp-session-id']
+      const answer = (payload: unknown, minted_id?: string) => {
+        response.writeHead(200, {
+          'content-type': 'application/json',
+          ...(minted_id === undefined ? {} : { 'mcp-session-id': minted_id }),
+        })
+        response.end(JSON.stringify(payload))
+      }
+      if (message.method === 'initialize') {
+        minted += 1
+        const id = `sess-${minted}`
+        live.add(id)
+        answer({
+          jsonrpc: '2.0',
+          id: message.id,
+          result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'http', version: '1' } },
+        }, id)
+        return
+      }
+      // Anything carrying a revoked (or unknown) session id gets the 404 a restarted server sends.
+      if (typeof sessionId !== 'string' || !live.has(sessionId)) {
+        response.writeHead(404, { 'content-type': 'text/plain' })
+        response.end('session not found')
+        return
+      }
+      if (message.method === 'tools/list') {
+        answer({ jsonrpc: '2.0', id: message.id, result: { tools: [{ name: 'ping', description: 'ping', inputSchema: { type: 'object', properties: {} } }] } })
+        return
+      }
+      if (message.method === 'tools/call') {
+        calls += 1
+        answer({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'pong' }] } })
+        // Revoke the session the call used: the next request on it must be rejected.
+        live.delete(sessionId)
+        return
+      }
+      response.writeHead(404, { 'content-type': 'text/plain' })
+      response.end('unknown method')
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (address === null || typeof address === 'string') throw new Error('the test server has no port')
+  cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())))
+
+  const config = serverEntry('live', { url: `http://127.0.0.1:${address.port}/mcp` })
+  const pool = new ServerPool({ home: join(mkdtempSync(join(tmpdir(), 'mcp-http-')), 'home'), logger: { debug() {}, warn() {} } })
+  cleanups.push(() => pool.closeAll())
+  await pool.configure([{ config }])
+  await pool.catalog('live')
+
+  const first = await pool.callTool('live', 'ping', {}) as { content: Array<{ text: string }> }
+  expect(first.content[0].text).toBe('pong')
+  expect(calls).toBe(1)
+
+  // The session this connection held was just revoked. Before the fix the pool kept it, still
+  // reported `connected`, and failed every later call with the same 404.
+  const second = await pool.callTool('live', 'ping', {}) as { content: Array<{ text: string }> }
+  expect(second.content[0].text).toBe('pong')
+  expect(calls).toBe(2)
+  // A replacement session was minted, so the retry really went out on a new connection.
+  expect(minted).toBeGreaterThanOrEqual(2)
+})

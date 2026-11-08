@@ -220,4 +220,39 @@ describe('config', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+  // `oauth`/`auth` used to normalize onto the config and then reach no consumer, so an OAuth-protected
+  // server failed at connect with a bare 401 that looked like any other outage. Refusing it at load
+  // time and naming the supported alternative is the same contract the socket refusal above follows
+  // (ADR-0011); silently accepting the object would be worse than refusing it.
+  it('refuses an OAuth server at load time instead of accepting a field nothing reads', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mcp-oauth-'))
+    try {
+      const repo = join(root, 'repo')
+      mkdirSync(join(repo, '.git'), { recursive: true })
+      writeFileSync(join(repo, '.mcp.json'), JSON.stringify({
+        mcpServers: {
+          oauthed: { url: 'https://example.test/mcp', oauth: {} },
+          spelled: { url: 'https://example.test/mcp', auth: 'oauth' },
+          token: { url: 'https://example.test/mcp', headers: { Authorization: 'Bearer x' } },
+          // `oauth: false` asks for no OAuth at all, which is exactly what this adapter does.
+          plain: { url: 'https://example.test/mcp', oauth: false },
+        },
+      }))
+
+      const loaded = loadConfig({ cwd: repo, dshHome: join(root, 'home'), env: {}, homeDir: join(root, 'home') })
+
+      expect(loaded.servers.has('oauthed')).toBe(false)
+      expect(loaded.servers.has('spelled')).toBe(false)
+      expect(loaded.servers.has('token')).toBe(true)
+      expect(loaded.servers.has('plain')).toBe(true)
+      const errors = loaded.errors.join('\n')
+      expect(errors).toMatch(/server "oauthed" asks for OAuth/)
+      expect(errors).toMatch(/server "spelled" asks for OAuth/)
+      // The reason names what to do instead, so the message is actionable rather than a dead end.
+      expect(errors).toMatch(/bearerTokenEnv/)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
 })

@@ -377,6 +377,28 @@ function refuseUnsupportedTransport(name: string, label: string, config: ServerE
 }
 
 /**
+ * Refuse an entry that asked for OAuth, rather than normalizing the field and never reading it.
+ *
+ * `normalizeEntry` used to copy `oauth` and `auth` onto the config, where nothing consumed them: a
+ * server protected by OAuth then failed at connect time with a bare 401 and the user had no way to
+ * tell "I configured this wrong" from "this server is down". An explicit refusal at load time names
+ * the supported alternative instead (ADR-0011). Accepting the object and ignoring it would be the
+ * worse contract, which is the same rule the unix-socket refusal above follows.
+ * @returns whether the entry was refused, so the caller skips it.
+ */
+function refuseUnsupportedAuth(name: string, label: string, config: ServerEntry, errors: string[]): boolean {
+  if (isDisabledEntry(config)) return false
+  // `oauth: false` is a deliberate "do not use OAuth", which is this adapter's only mode: it is
+  // accepted rather than refused, because the config is asking for exactly what it gets.
+  if (config.auth !== 'oauth' && (config.oauth === undefined || config.oauth === false)) return false
+  errors.push(
+    `${label}: server "${name}" asks for OAuth (\`oauth\`/\`auth: "oauth"\`), which dsh-mcp-adapter does not support; ` +
+    'use `headers`, `bearerToken`, or `bearerTokenEnv` instead',
+  )
+  return true
+}
+
+/**
  * Load every source, merge by name (a later file replaces an earlier server outright), and
  * resolve settings. Nothing here touches the network.
  * @returns `{ projectRoot, servers, settings, errors, loaded, paths }`.
@@ -448,6 +470,7 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadedConfig {
       try {
         const config = normalizeEntry(name, raw, { env: environment })
         if (refuseUnsupportedTransport(name, source.path, config, errors)) continue
+        if (refuseUnsupportedAuth(name, source.path, config, errors)) continue
         servers.set(name, { origin: source.scope, path: source.path, config })
       } catch (error) {
         errors.push(`${source.path}: ${messageOf(error)}`)
@@ -468,6 +491,7 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadedConfig {
     try {
       const config = normalizeEntry(name, entry.raw, { env: environment })
       if (refuseUnsupportedTransport(name, entry.path, config, errors)) continue
+      if (refuseUnsupportedAuth(name, entry.path, config, errors)) continue
       servers.set(name, { origin: 'imported', path: entry.path, config })
     } catch (error) {
       errors.push(`${entry.path}: ${messageOf(error)}`)
@@ -483,6 +507,7 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadedConfig {
     try {
       const config = normalizeEntry(name, raw, { env: environment })
       if (refuseUnsupportedTransport(name, 'config.servers', config, errors)) continue
+      if (refuseUnsupportedAuth(name, 'config.servers', config, errors)) continue
       servers.set(name, { origin: 'config', path: '', config })
     } catch (error) {
       errors.push(`config.servers: ${messageOf(error)}`)

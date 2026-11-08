@@ -7,7 +7,7 @@
 
 import { basename, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { Client, SSEClientTransport, StreamableHTTPClientTransport, type ClientOptions, type Transport } from '@modelcontextprotocol/client'
+import { Client, SSEClientTransport, SdkHttpError, StreamableHTTPClientTransport, type ClientOptions, type Transport } from '@modelcontextprotocol/client'
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio'
 import type { AdapterSettings } from './config.ts'
 import { fetchWithCa, readCaBundle, type FetchLike } from './tls-fetch.ts'
@@ -159,6 +159,23 @@ function scrubbedEnv(): Record<string, string> {
  * because the alternative — refusing to start — would take every user-global server away from
  * headless callers for no benefit. Config discovery and approval never make this guess.
  */
+/**
+ * Whether a failure means the server forgot this legacy Streamable HTTP session.
+ *
+ * A legacy streamable session lives on the server under an `Mcp-Session-Id`; a server that was
+ * restarted answers the next POST with 404, or with the 400 a freshly restarted single-session
+ * server emits. The transport surfaces that as an `SdkHttpError` and does **not** fire `onclose`, so
+ * without this check the pool kept a dead connection and advertised `connected` forever (ADR-0011).
+ *
+ * Only connections that actually hold a session id qualify: a stateless (modern) connection has no
+ * session to expire, and its 404 for an unknown method must not be mistaken for one.
+ */
+function isExpiredSession(error: unknown, transport: Transport | undefined): boolean {
+  if (!(error instanceof SdkHttpError)) return false
+  if (error.data.status !== 404) return false
+  return (transport as { sessionId?: string } | undefined)?.sessionId !== undefined
+}
+
 function resolveServerCwd(config: ServerConfig, sessionCwd: string | undefined): string | undefined {
   if (config.cwd === undefined || config.cwd.length === 0) return sessionCwd
   return sessionCwd === undefined ? resolve(config.cwd) : resolve(sessionCwd, config.cwd)
@@ -545,6 +562,25 @@ export class ServerPool {
     entry.changeTimer.unref?.()
   }
 
+  /**
+   * Replace a connection whose session the server no longer recognizes, and return the replacement.
+   *
+   * The old connection is closed first so its transport cannot keep an SSE stream alive against a
+   * session that is already gone. `ensure()` then reconnects through the normal path, which also
+   * re-arms `onclose`/`onerror` and re-reads the catalog lazily.
+   */
+  private async reconnect(stale: Connection, entry: PoolEntry): Promise<Connection> {
+    const name = entry.config.name
+    this.logger?.warn?.(`mcp-adapter: ${name} lost its MCP session; reconnecting once`)
+    if (entry.connection === stale) entry.connection = undefined
+    try {
+      await stale.close()
+    } catch {
+      // Already gone; the reconnect below is what matters.
+    }
+    return this.ensure(name)
+  }
+
   async safeClose(client: Client | undefined, transport: Transport | undefined): Promise<void> {
     try {
       await client?.close?.()
@@ -699,17 +735,27 @@ export class ServerPool {
   async callTool(name: string, toolName: string, args: unknown, { signal }: { signal?: AbortSignal } = {}): Promise<unknown> {
     const entry = this.servers.get(name)
     if (entry === undefined) throw new Error(`unknown MCP server "${name}"`)
-    const connection = await this.ensure(name, signal)
+    let connection = await this.ensure(name, signal)
     const timeoutMs = this.timeoutFor(entry)
     await this.ensureOutputSchemaValidation(name, entry, connection, toolName, timeoutMs, signal)
     // `@modelcontextprotocol/client` 2.x dropped the `resultSchema` argument the source still passed,
     // so the per-request options live in the second position; leaving them third would typecheck and
     // silently discard both the timeout and the cancellation signal.
-    const result = await callToolPausingForElicitation(
-      connection.client,
+    const run = (target: Connection) => callToolPausingForElicitation(
+      target.client,
       { name: toolName, arguments: toolArguments(args) },
       { timeout: timeoutMs, signal },
     )
+    let result: unknown
+    try {
+      result = await run(connection)
+    } catch (error) {
+      if (!isExpiredSession(error, connection.transport)) throw error
+      // The server no longer knows this session. One reconnect and one retry is the whole recovery:
+      // a second expiry means the endpoint itself is cycling, which belongs in `lastError`.
+      connection = await this.reconnect(connection, entry)
+      result = await run(connection)
+    }
     connection.lastUsedAt = Date.now()
     return result
   }
@@ -751,17 +797,31 @@ export class ServerPool {
   async readResource(name: string, uri: string, { signal }: { signal?: AbortSignal } = {}): Promise<unknown> {
     const entry = this.servers.get(name)
     if (entry === undefined) throw new Error(`unknown MCP server "${name}"`)
-    const connection = await this.ensure(name)
     const timeoutMs = this.timeoutFor(entry)
-    return connection.client.readResource({ uri }, { timeout: timeoutMs, signal })
+    let connection = await this.ensure(name)
+    const run = (target: Connection) => target.client.readResource({ uri }, { timeout: timeoutMs, signal })
+    try {
+      return await run(connection)
+    } catch (error) {
+      if (!isExpiredSession(error, connection.transport)) throw error
+      connection = await this.reconnect(connection, entry)
+      return await run(connection)
+    }
   }
 
   async getPrompt(name: string, promptName: string, args: unknown, { signal }: { signal?: AbortSignal } = {}): Promise<unknown> {
     const entry = this.servers.get(name)
     if (entry === undefined) throw new Error(`unknown MCP server "${name}"`)
-    const connection = await this.ensure(name)
     const timeoutMs = this.timeoutFor(entry)
-    return connection.client.getPrompt({ name: promptName, arguments: promptArguments(args) }, { timeout: timeoutMs, signal })
+    let connection = await this.ensure(name)
+    const run = (target: Connection) => target.client.getPrompt({ name: promptName, arguments: promptArguments(args) }, { timeout: timeoutMs, signal })
+    try {
+      return await run(connection)
+    } catch (error) {
+      if (!isExpiredSession(error, connection.transport)) throw error
+      connection = await this.reconnect(connection, entry)
+      return await run(connection)
+    }
   }
 
   /**

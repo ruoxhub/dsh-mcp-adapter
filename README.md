@@ -175,7 +175,7 @@ mcp({ tool: "browser_take_screenshot", args: { fullPage: true } })  # 调用；�
 dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 ```
 
-包名已改为 `@ruoxhub/dsh-mcp-adapter`（裸名 `dsh-mcp-adapter` 在 npm 上属于别的发布者），尚未发布到 registry；挂载不依赖包名——bundle 以 profile `dependencies` 的键解析，所以 `link:` 用任意本地键都能挂上。
+包名为 `@moruoxing/dsh-mcp-adapter`（裸名 `dsh-mcp-adapter` 在 npm 上属于别的发布者）。挂载不依赖包名——bundle 以 profile `dependencies` 的键解析，所以 `link:` 用任意本地键都能挂上。
 
 ## 验证
 

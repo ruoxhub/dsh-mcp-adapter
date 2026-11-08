@@ -28,6 +28,16 @@ import type { BlockedServer } from './trust.ts'
 import type { Catalog, CatalogPrompt, CatalogTool, ContentBlock, ServerConfig, ToolRunLike } from './types.ts'
 
 export const IDLE_SWEEP_INTERVAL_MS = 30_000
+/**
+ * Per-server cap on injected instructions, and the session-wide cap across all servers.
+ *
+ * Server instructions are server-authored text placed in every request of the session. The host's own
+ * MCP client bounds them at 32 KB for one server; this adapter keeps one server's share at 4 KB and
+ * the whole block at 32 KB, so a chatty server cannot crowd out the tool definitions that are the
+ * point of having MCP at all.
+ */
+export const INSTRUCTION_CHARS_PER_SERVER = 4 * 1024
+export const INSTRUCTION_CHARS_TOTAL = 32 * 1024
 
 /** What `signature()` reads off a file: the two fields that change when the file does. */
 export interface StatLike {
@@ -121,10 +131,11 @@ function signature(paths: string[], stat: (path: string) => StatLike): string {
  * which made the documented setting inert — a server with no `requestTimeoutMs` silently used the
  * pool's 60 s constant no matter what the user configured.
  */
-function pickPolicySettings(settings: McpSessionSettings): Pick<AdapterSettings, 'idleTimeout' | 'projectServers' | 'directTools' | 'approveTools' | 'exposeResources' | 'toolPrefix' | 'importHosts' | 'maxOutputChars' | 'requestTimeoutMs'> {
+function pickPolicySettings(settings: McpSessionSettings): Pick<AdapterSettings, 'idleTimeout' | 'projectServers' | 'directTools' | 'approveTools' | 'exposeResources' | 'toolPrefix' | 'importHosts' | 'maxOutputChars' | 'requestTimeoutMs' | 'executionTimeoutMs'> {
   return {
     idleTimeout: settings.idleTimeout,
     requestTimeoutMs: settings.requestTimeoutMs,
+    executionTimeoutMs: settings.executionTimeoutMs,
     projectServers: settings.projectServers,
     directTools: settings.directTools,
     approveTools: settings.approveTools,
@@ -706,9 +717,46 @@ export class McpSession {
     const lines: string[] = []
     const mounted = this.pool.names()
     if (mounted.length > 0) lines.push(`MCP servers available: ${mounted.join(', ')} — reach their tools with the mcp tool.`)
+    lines.push(...this.instructionBlocks())
     if (this.blocked.length > 0) lines.push(`MCP servers blocked by project trust: ${this.blocked.map((entry) => entry.name).join(', ')} — run /mcp-adapter approve <name>.`)
     if (this.errors.length > 0) lines.push(`MCP config problems: ${this.errors.join('; ')}.`)
     return lines.join('\n')
+  }
+
+  /**
+   * Every mounted server's own usage guidance, for the system prompt.
+   *
+   * A server's instructions are how it says "call `open_project` before `query`" — the model cannot
+   * discover that by searching a catalog, and asking for it with `mcp({ instructions })` only helps a
+   * model that already suspects there is something to ask. Both a mature client (`<mcp_instructions>`)
+   * and the host's own MCP client inject them, so this adapter does too.
+   *
+   * Bounded deliberately: instructions are server-authored text that lands in every request of the
+   * session, so one verbose server must not crowd out the tools. Per server the cap is
+   * {@link INSTRUCTION_CHARS_PER_SERVER}; across all of them it is {@link INSTRUCTION_CHARS_TOTAL}, and a
+   * server that does not fit is reported by name rather than silently dropped.
+   */
+  instructionBlocks(): string[] {
+    const present = this.pool.names()
+      .map((name) => ({ name, text: (this.pool.get(name)?.catalog?.instructions ?? '').trim() }))
+      .filter((entry) => entry.text.length > 0)
+      .sort((left, right) => left.name.localeCompare(right.name))
+    if (present.length === 0) return []
+
+    const blocks: string[] = []
+    let used = 0
+    for (const { name, text } of present) {
+      const bounded = text.length > INSTRUCTION_CHARS_PER_SERVER
+        ? `${text.slice(0, INSTRUCTION_CHARS_PER_SERVER)}\n… [truncated at ${INSTRUCTION_CHARS_PER_SERVER} characters]`
+        : text
+      if (used + bounded.length > INSTRUCTION_CHARS_TOTAL) {
+        blocks.push(`  <server name="${name}">instructions omitted: the session's instruction budget is exhausted</server>`)
+        continue
+      }
+      used += bounded.length
+      blocks.push(`  <server name="${name}">\n${bounded.split('\n').map((line) => `    ${line}`).join('\n')}\n  </server>`)
+    }
+    return ['', '<mcp_instructions>', ...blocks, '</mcp_instructions>']
   }
 
   async dispose(): Promise<void> {

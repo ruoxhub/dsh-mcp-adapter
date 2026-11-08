@@ -18,6 +18,11 @@ import type { ServerCatalog, ServerConfig } from './types.ts'
 import { withTimeout } from './util.ts'
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000
+/**
+ * Default for one execution. Ten minutes: long enough for a browser session, a build or an export,
+ * short enough that a wedged server still fails inside one turn.
+ */
+export const DEFAULT_EXECUTION_TIMEOUT_MS = 10 * 60_000
 export const RECONNECT_BASE_MS = 500
 export const RECONNECT_MAX_MS = 30_000
 /** How long a burst of list-changed notifications is coalesced before one catalog read. */
@@ -380,6 +385,22 @@ export class ServerPool {
     return typeof configured === 'number' && Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_REQUEST_TIMEOUT_MS
   }
 
+  /**
+   * The timeout one *execution* gets: a tool call, a resource read, or a prompt render.
+   *
+   * Kept apart from {@link timeoutFor} because one shared value is wrong for one of the two risks.
+   * A handshake that takes a minute is a broken server; a tool that drives a browser, runs a build,
+   * or exports a report legitimately takes many minutes, and cutting it at the handshake budget
+   * turns a working server into "MCP call failed: timed out" (ADR-0011).
+   */
+  executionTimeoutFor(entry: PoolEntry): number {
+    if (entry.config.executionTimeoutMs !== undefined) return entry.config.executionTimeoutMs
+    const configured = this.settings.executionTimeoutMs
+    return typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+      ? configured
+      : DEFAULT_EXECUTION_TIMEOUT_MS
+  }
+
   names(): string[] {
     return [...this.servers.keys()]
   }
@@ -736,8 +757,11 @@ export class ServerPool {
     const entry = this.servers.get(name)
     if (entry === undefined) throw new Error(`unknown MCP server "${name}"`)
     let connection = await this.ensure(name, signal)
-    const timeoutMs = this.timeoutFor(entry)
-    await this.ensureOutputSchemaValidation(name, entry, connection, toolName, timeoutMs, signal)
+    // The listing that arms output-schema validation is a catalog request; the call itself is an
+    // execution, so the two budgets differ.
+    const listTimeoutMs = this.timeoutFor(entry)
+    await this.ensureOutputSchemaValidation(name, entry, connection, toolName, listTimeoutMs, signal)
+    const timeoutMs = this.executionTimeoutFor(entry)
     // `@modelcontextprotocol/client` 2.x dropped the `resultSchema` argument the source still passed,
     // so the per-request options live in the second position; leaving them third would typecheck and
     // silently discard both the timeout and the cancellation signal.
@@ -797,7 +821,7 @@ export class ServerPool {
   async readResource(name: string, uri: string, { signal }: { signal?: AbortSignal } = {}): Promise<unknown> {
     const entry = this.servers.get(name)
     if (entry === undefined) throw new Error(`unknown MCP server "${name}"`)
-    const timeoutMs = this.timeoutFor(entry)
+    const timeoutMs = this.executionTimeoutFor(entry)
     let connection = await this.ensure(name)
     const run = (target: Connection) => target.client.readResource({ uri }, { timeout: timeoutMs, signal })
     try {
@@ -812,7 +836,7 @@ export class ServerPool {
   async getPrompt(name: string, promptName: string, args: unknown, { signal }: { signal?: AbortSignal } = {}): Promise<unknown> {
     const entry = this.servers.get(name)
     if (entry === undefined) throw new Error(`unknown MCP server "${name}"`)
-    const timeoutMs = this.timeoutFor(entry)
+    const timeoutMs = this.executionTimeoutFor(entry)
     let connection = await this.ensure(name)
     const run = (target: Connection) => target.client.getPrompt({ name: promptName, arguments: promptArguments(args) }, { timeout: timeoutMs, signal })
     try {

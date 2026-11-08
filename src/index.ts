@@ -115,11 +115,11 @@ export function sanitizeConfig(config: Record<string, unknown> = {}): AdapterCon
     configFiles: Array.isArray(config.configFiles) ? config.configFiles : [],
     // Optional defaults, overridden by each project's own `settings`.
     idleTimeout: typeof idleTimeout === 'number' && Number.isFinite(idleTimeout) ? idleTimeout : 10,
-    // The Loader entry has no timeout key: a request timeout is a per-server setting, and
-    // `pickPolicySettings` never forwards this one. The field is declared because a live session
-    // carries the full settings layer, so the entry states the default `loadConfig` would apply —
-    // inert either way, exactly as the source's omission left it.
+    // The Loader entry has no timeout key: both timeouts are per-server settings that a project's
+    // own `settings` file may also override. These fields are declared because a live session carries
+    // the full settings layer, so the entry states the defaults `loadConfig` would apply.
     requestTimeoutMs: DEFAULT_SETTINGS.requestTimeoutMs,
+    executionTimeoutMs: DEFAULT_SETTINGS.executionTimeoutMs,
     // Unset takes the default; a value that is not one of the three literals is a typo at a trust
     // boundary, so it fails closed to `ask` instead of silently widening to the `allow` default.
     projectServers: projectServers === undefined

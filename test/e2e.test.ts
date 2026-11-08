@@ -18,7 +18,7 @@ import { afterEach, expect, it } from 'vitest'
 import { cachedEntry, loadCache, saveCache, storeEntry } from '../src/cache.ts'
 import { buildCatalog, describeTool, searchTools } from '../src/catalog.ts'
 import { DEFAULT_SETTINGS, findProjectRoot, isDisabledEntry, loadConfig, normalizeEntry } from '../src/config.ts'
-import { McpSession } from '../src/session.ts'
+import { INSTRUCTION_CHARS_PER_SERVER, INSTRUCTION_CHARS_TOTAL, McpSession } from '../src/session.ts'
 import { ServerPool } from '../src/servers.ts'
 import type { Connection, PoolEntry } from '../src/servers.ts'
 import { TEST_SERVER_SOURCE } from '../src/testserver.ts'
@@ -707,10 +707,12 @@ it('lazy-keep-alive survives the idle sweep and reconnects, while lazy does not'
 })
 
 // The settings-level timeout used to be dropped on the floor by `pickPolicySettings`, so a server
-// with no per-server value always got the pool's 60 s constant. The proof is a server that answers
-// slowly: with a 1 ms settings default the call must fail fast rather than wait.
-it('a settings-level requestTimeoutMs actually reaches the request', async () => {
-  const SLOW_SERVER = `
+// with no per-server value always got the pool's 60 s constant. The proof is a server whose
+// `tools/list` stalls: with a 1 s settings default the listing must fail fast rather than wait.
+//
+// This covers the *catalog* budget. `tools/list` is a request; a tool call is an execution with its
+// own, much larger budget (ADR-0011).
+const SLOW_CATALOG_SERVER_SOURCE = `
 const LF = String.fromCharCode(10);
 const send = (message) => process.stdout.write(JSON.stringify(message) + LF);
 let buffer = '';
@@ -729,29 +731,79 @@ function handle(message) {
   if (method === 'initialize') return send({ jsonrpc: '2.0', id: message.id, result: {
     protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'slow', version: '1.0.0' },
   } });
-  if (method === 'tools/list') return send({ jsonrpc: '2.0', id: message.id, result: { tools: [
-    { name: 'slow', description: 'Answers after a long pause.', inputSchema: { type: 'object', properties: {} } },
-  ] } });
-  if (method === 'tools/call') return setTimeout(() => send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'late' }] } }), 30_000);
+  // Never answers: only the configured deadline can end this listing.
+  if (method === 'tools/list') return;
   send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'unknown method ' + method } });
 }
 `
-  const fixes = fixture(SLOW_SERVER)
+
+it('a settings-level requestTimeoutMs bounds the catalog listing', async () => {
+  const fixes = fixture(SLOW_CATALOG_SERVER_SOURCE)
   writeServerConfig(fixes.project, fixes.server)
 
-  // Through the session, not a hand-built pool: the bug was that  dropped the
-  // setting on its way from the Loader entry into the pool, so a pool built directly would hide it.
-  const { session } = makeSession(fixes, { requestTimeoutMs: 1_000 })
+  const { session } = makeSession(fixes, { requestTimeoutMs: 200 })
   await session.sync()
-  session.registerTools()
-  await session.refreshCatalog()
-
   const entry = session.pool.get('demo')
   if (entry === undefined) throw new Error('the fixture server was not pooled')
-  // The per-server entry has no timeout, so only the settings default can make this fail.
+  // The per-server entry has no timeout, so only the settings default can end the listing.
   expect(entry.config.requestTimeoutMs).toBeUndefined()
-  expect(session.pool.timeoutFor(entry)).toBe(1_000)
-  await expect(session.callApproved('demo_slow', {}, undefined)).rejects.toThrow(/timed out|timeout|did not finish/i)
+  expect(session.pool.timeoutFor(entry)).toBe(200)
+  // An execution keeps its own, much larger budget: that split is the point of ADR-0011.
+  expect(session.pool.executionTimeoutFor(entry)).toBe(DEFAULT_SETTINGS.executionTimeoutMs)
+
+  const started = Date.now()
+  await expect(session.pool.catalog('demo')).rejects.toThrow(/timed out|timeout/i)
+  expect(Date.now() - started).toBeLessThan(5_000)
+  await session.dispose()
+})
+
+// The other half of the split: a tool that legitimately runs for minutes used to be cut off at the
+// handshake budget. A per-server `executionTimeoutMs` now decides, and the slow call fails on *that*
+// deadline rather than on the 60 s request default or the 10 min execution default.
+it('executionTimeoutMs bounds a tool call without touching the catalog budget', async () => {
+  const fixes = fixture(`
+const LF = String.fromCharCode(10);
+const send = (message) => process.stdout.write(JSON.stringify(message) + LF);
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (let at = buffer.indexOf(LF); at >= 0; at = buffer.indexOf(LF)) {
+    const line = buffer.slice(0, at).trim();
+    buffer = buffer.slice(at + 1);
+    if (line.length > 0) handle(JSON.parse(line));
+  }
+});
+function handle(message) {
+  if (message.id === undefined) return;
+  const { method } = message;
+  if (method === 'initialize') return send({ jsonrpc: '2.0', id: message.id, result: {
+    protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'slow-call', version: '1.0.0' },
+  } });
+  if (method === 'tools/list') return send({ jsonrpc: '2.0', id: message.id, result: { tools: [
+    { name: 'slow', description: 'Never answers.', inputSchema: { type: 'object', properties: {} } },
+  ] } });
+  // Never answers: only the execution deadline can end this call.
+  if (method === 'tools/call') return;
+  send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'unknown method ' + method } });
+}
+`)
+  writeFileSync(join(fixes.project, '.mcp.json'), JSON.stringify({
+    mcpServers: { demo: { command: process.execPath, args: [fixes.server], executionTimeoutMs: 200 } },
+  }), 'utf8')
+
+  const { session } = makeSession(fixes)
+  await session.sync()
+  await session.refreshCatalog()
+  const entry = session.pool.get('demo')
+  if (entry === undefined) throw new Error('the fixture server was not pooled')
+  // The catalog was read under the request budget; only the call runs under the execution budget.
+  expect(session.pool.timeoutFor(entry)).toBe(DEFAULT_SETTINGS.requestTimeoutMs)
+  expect(session.pool.executionTimeoutFor(entry)).toBe(200)
+
+  const started = Date.now()
+  await expect(session.callApproved('demo_slow', {}, undefined)).rejects.toThrow(/timed out|timeout/i)
+  expect(Date.now() - started).toBeLessThan(5_000)
   await session.dispose()
 })
 
@@ -1349,4 +1401,57 @@ it('an image an MCP tool returns reaches the model as an image block', async () 
   // The bytes really went through the host store, in the server's own media type.
   expect(saved).toEqual([{ mediaType: 'image/png', bytes: expect.any(Number) as number }])
   expect(saved[0].bytes).toBeGreaterThan(0)
+})
+
+// P2-7 (ADR-0011): a server's own instructions must reach the model without being asked for.
+//
+// `summary()` is the adapter's whole system-prompt surface, and it listed server *names* only, so a
+// server whose instructions say "always call open_project first" was followed only by a model that
+// thought to call `mcp({ instructions })`. Both a mature client and the host's MCP client inject them.
+it('surfaces a server instruction block in the system prompt summary', async () => {
+  const fixes = fixture()
+  writeServerConfig(fixes.project, fixes.server)
+  const { session } = makeSession(fixes)
+  await session.sync()
+  await session.refreshCatalog()
+
+  const summary = session.summary()
+  expect(summary).toContain('<mcp_instructions>')
+  expect(summary).toContain('<server name="demo">')
+  // Indented like the host's own MCP instruction block, so multi-line guidance stays readable.
+  expect(summary).toContain('    Use ping for a health check.')
+  expect(summary).toContain('</mcp_instructions>')
+})
+
+it('bounds one server instruction and reports a server that does not fit the session budget', async () => {
+  const fixes = fixture()
+  writeFileSync(join(fixes.project, '.mcp.json'), JSON.stringify({
+    mcpServers: { verbose: { command: process.execPath, args: [fixes.server] } },
+  }), 'utf8')
+  const { session } = makeSession(fixes)
+  await session.sync()
+  await session.refreshCatalog()
+
+  // A server whose instructions exceed the per-server cap keeps a truncated block rather than
+  // pushing an unbounded wall of text into every request.
+  const entry = session.pool.get('verbose')
+  if (entry === undefined || entry.catalog === undefined) throw new Error('the fixture catalog is missing')
+  entry.catalog = { ...entry.catalog, instructions: 'x'.repeat(INSTRUCTION_CHARS_PER_SERVER + 500) }
+  const bounded = session.summary()
+  expect(bounded).toContain(`[truncated at ${INSTRUCTION_CHARS_PER_SERVER} characters]`)
+  expect(bounded.length).toBeLessThan(INSTRUCTION_CHARS_PER_SERVER * 2)
+
+  // Servers that each fit per-server but not together: the ones past the session budget are reported
+  // by name instead of being silently dropped, so the model can still ask for them explicitly.
+  // Nine servers at the 4 KB per-server cap exceed the 32 KB total, so the last ones cannot fit.
+  const many = Array.from({ length: 9 }, (_unused, index) => `bulk${index}`)
+  await session.pool.configure(many.map((name) => ({ config: { ...entry.config, name } })))
+  for (const name of many) {
+    const pooled = session.pool.get(name)
+    if (pooled === undefined) throw new Error(`"${name}" is not pooled`)
+    pooled.catalog = { tools: [], resources: [], prompts: [], instructions: 'z'.repeat(INSTRUCTION_CHARS_PER_SERVER) }
+  }
+  const overBudget = session.summary()
+  expect(overBudget.length).toBeLessThan(INSTRUCTION_CHARS_TOTAL * 2)
+  expect(overBudget).toContain('<server name="bulk8">instructions omitted')
 })

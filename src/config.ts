@@ -25,8 +25,17 @@ const PROJECT_FILES = ['.dsh/mcp-adapter.json', '.mcp.json']
 export interface AdapterSettings {
   /** Minutes a lazy server may sit idle before it is stopped. 0 keeps it until the session ends. */
   idleTimeout: number
-  /** Milliseconds for one MCP request. */
+  /** Milliseconds for one MCP request: the handshake and every catalog listing. */
   requestTimeoutMs: number
+  /**
+   * Milliseconds one tool, resource or prompt *execution* may take.
+   *
+   * Separate from `requestTimeoutMs` because the two are different risks: a handshake or a
+   * `tools/list` that takes a minute is a broken server, while a tool that drives a browser, runs a
+   * build, or exports a report legitimately takes many minutes. One shared value can only be wrong for
+   * one of them (ADR-0011).
+   */
+  executionTimeoutMs: number
   /** `allow` mounts project servers as-is; `ask` holds one until that exact definition was approved; `deny` refuses them all. */
   projectServers: 'ask' | 'allow' | 'deny'
   /** Register every server's tools as first-class tools instead of through the `mcp` proxy. */
@@ -47,8 +56,10 @@ export interface AdapterSettings {
 export const DEFAULT_SETTINGS: AdapterSettings = {
   /** Minutes a lazy server may sit idle before it is stopped. 0 keeps it until the session ends. */
   idleTimeout: 10,
-  /** Milliseconds for one MCP request. */
+  /** Milliseconds for one MCP request: the handshake and every catalog listing. */
   requestTimeoutMs: 60_000,
+  /** Milliseconds one tool, resource or prompt execution may take. */
+  executionTimeoutMs: 10 * 60_000,
   /** A cloned repository's servers mount without approval; set `ask` to put the trust gate back. */
   projectServers: 'allow',
   /** Register every server's tools as first-class tools instead of through the `mcp` proxy. */
@@ -251,6 +262,12 @@ function requestTimeoutOf(raw: Record<string, unknown>): number | undefined {
   return undefined
 }
 
+/** `executionTimeoutMs` is its own key: it bounds one execution, never the handshake or a listing. */
+function executionTimeoutOf(raw: Record<string, unknown>): number | undefined {
+  const value = raw.executionTimeoutMs
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
 function requestHeadersCommandOf(raw: Record<string, unknown>, env: NodeJS.ProcessEnv): HttpRequestHeadersCommand | undefined {
   const val = raw.requestHeadersCommand
   if (!val) return undefined
@@ -316,6 +333,7 @@ export function normalizeEntry(name: string, raw: unknown, { env = process.env }
   const auth = raw.auth === 'oauth' || raw.auth === 'bearer' || raw.auth === false ? raw.auth : undefined
   const httpTransport = httpTransportOf(raw)
   const requestTimeoutMs = requestTimeoutOf(raw)
+  const executionTimeoutMs = executionTimeoutOf(raw)
   const requestHeadersCommand = requestHeadersCommandOf(raw, env)
 
   return {
@@ -344,6 +362,7 @@ export function normalizeEntry(name: string, raw: unknown, { env = process.env }
     lifecycle: lifecycleOf(raw.lifecycle),
     ...(typeof raw.idleTimeout === 'number' && Number.isFinite(raw.idleTimeout) && raw.idleTimeout >= 0 ? { idleTimeout: raw.idleTimeout } : {}),
     ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
+    ...(executionTimeoutMs === undefined ? {} : { executionTimeoutMs }),
     directTools: raw.directTools === true || raw.directTools === 'search' || Array.isArray(raw.directTools) ? raw.directTools : false,
     ...(Array.isArray(raw.includeTools) ? { includeTools: raw.includeTools.map(String) } : {}),
     ...(Array.isArray(raw.excludeTools) ? { excludeTools: raw.excludeTools.map(String) } : {}),

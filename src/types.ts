@@ -51,7 +51,10 @@ export interface ServerConfig {
   bearerTokenEnv?: string
   lifecycle: 'lazy' | 'keep-alive' | 'lazy-keep-alive' | 'eager'
   idleTimeout?: number
+  /** Bounds the handshake and every catalog listing. */
   requestTimeoutMs?: number
+  /** Bounds one execution: a tool call, a resource read, or a prompt render. */
+  executionTimeoutMs?: number
   directTools: boolean | 'search' | string[]
   includeTools?: string[]
   excludeTools?: string[]

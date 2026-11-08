@@ -172,11 +172,10 @@ mcp({ tool: "browser_take_screenshot", args: { fullPage: true } })  # 调用；�
 装进 profile（桌面端 profile 被 Electron 独占，走 Web UI 的 Plugins 页）：
 
 ```bash
-dsh plugin --profile <name> add @ruoxhub/dsh-mcp-adapter   # 从 registry 装
-dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter   # 从本地检出装
+dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 ```
 
-bundle 名以 profile `dependencies` 的键为准，`link:` 安装可以用任意本地键，所以本地开发时包名改成什么都不影响挂载。
+包名已改为 `@ruoxhub/dsh-mcp-adapter`（裸名 `dsh-mcp-adapter` 在 npm 上属于别的发布者），尚未发布到 registry；挂载不依赖包名——bundle 以 profile `dependencies` 的键解析，所以 `link:` 用任意本地键都能挂上。
 
 ## 验证
 

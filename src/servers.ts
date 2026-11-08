@@ -556,6 +556,15 @@ export class ServerPool {
     }
 
     const tools = await attempt('tools/list', () => connection.client.listTools(undefined, options))
+    // A server that advertises no tools capability answers an empty list without an error, so reaching
+    // here with nothing but a recorded failure means `tools/list` really failed. Handing that back as an
+    // empty catalog is what used to poison the disk cache: `refreshCatalog()` persisted it, the next
+    // session hash-matched it, and the server showed zero tools forever with no path back (ADR-0011).
+    // Throwing leaves `entry.catalog` undefined, so the next read retries instead of trusting a failure.
+    if (tools === undefined && failures.length > 0) {
+      entry.lastError = failures.join('; ')
+      throw new Error(`server "${name}" could not list its tools: ${entry.lastError}`)
+    }
     // A listing happened on this connection, so the SDK's per-call output-schema validation is armed.
     if (tools !== undefined) connection.toolsListed = true
     for (const tool of tools?.tools ?? []) {

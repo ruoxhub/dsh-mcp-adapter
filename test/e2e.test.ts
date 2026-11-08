@@ -978,3 +978,110 @@ appendCwdReport(process.argv[2], process.cwd() + '\\n');
 
   expect(readFileSync(report, 'utf8').trim()).toBe(nested)
 })
+
+// P0-1 (ADR-0011): a failed `tools/list` must not be captured as an empty catalog.
+//
+// The old path recorded the failure in `lastError`, returned an empty `ServerCatalog`, and left the
+// entry `connected`. `refreshCatalog()` then persisted it, the next session's `configHash` matched,
+// and the server showed zero tools forever — a transient error during startup became permanent
+// state. The proof needs both halves: the disk must not gain an entry, and a later read must retry.
+const FLAKY_TOOLS_LIST_SOURCE = `
+const LF = String.fromCharCode(10);
+const send = (message) => process.stdout.write(JSON.stringify(message) + LF);
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (let at = buffer.indexOf(LF); at >= 0; at = buffer.indexOf(LF)) {
+    const line = buffer.slice(0, at).trim();
+    buffer = buffer.slice(at + 1);
+    if (line.length > 0) handle(JSON.parse(line));
+  }
+});
+// The first tools/list fails the way a starting server does; every later one answers.
+let failures = 1;
+function handle(message) {
+  if (message.id === undefined) return;
+  const { method, params = {} } = message;
+  if (method === 'initialize') return send({ jsonrpc: '2.0', id: message.id, result: {
+    protocolVersion: params.protocolVersion ?? '2024-11-05',
+    capabilities: { tools: {} },
+    serverInfo: { name: 'flaky', version: '1.0.0' },
+  } });
+  if (method === 'tools/list') {
+    if (failures > 0) {
+      failures -= 1;
+      return send({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'temporarily unavailable' } });
+    }
+    return send({ jsonrpc: '2.0', id: message.id, result: { tools: [
+      { name: 'late_tool', description: 'Appears once the server stops failing.', inputSchema: { type: 'object', properties: {} } },
+    ] } });
+  }
+  send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'unknown method ' + method } });
+}
+`
+
+it('a failed tools/list is not persisted as an empty catalog, and the next read retries', async () => {
+  const fixes = fixture(FLAKY_TOOLS_LIST_SOURCE)
+  writeFileSync(join(fixes.project, '.mcp.json'), JSON.stringify({
+    mcpServers: { flaky: { command: process.execPath, args: [fixes.server] } },
+  }), 'utf8')
+  const { session } = makeSession(fixes)
+  await session.sync()
+
+  // The first listing fails. Nothing may be recorded as "this server has no tools".
+  await session.refreshCatalog()
+  const cacheFile = join(loadConfig({ cwd: fixes.project, dshHome: fixes.home }).home, 'mcp-cache.json')
+  expect(session.errors.join('\n')).toMatch(/could not list its tools/)
+  // Not persisted: a failure is not a catalog, so the next start has nothing to hash-match.
+  expect(loadCache(cacheFile).servers.flaky).toBeUndefined()
+  // And the pool keeps no catalog either, which is what makes the next read retry.
+  expect(session.pool.get('flaky')?.catalog).toBeUndefined()
+
+  // The second read retries, and this time the server answers.
+  await session.refreshCatalog()
+  const recovered = session.pool.get('flaky')?.catalog
+  expect(recovered?.tools.map((tool) => tool.name)).toEqual(['late_tool'])
+  expect(loadCache(cacheFile).servers.flaky?.tools.map((tool) => tool.name)).toEqual(['late_tool'])
+})
+
+it('a server with no tools capability still yields an empty catalog instead of failing', async () => {
+  // The guard above must not misfire on the normal case: `initialize` advertises no tools, the SDK
+  // short-circuits `listTools()` to an empty list, and no failure is recorded — so a resource-only
+  // server stays a legitimate empty-catalog server rather than a broken one.
+  const fixes = fixture(`
+const LF = String.fromCharCode(10);
+const send = (message) => process.stdout.write(JSON.stringify(message) + LF);
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (let at = buffer.indexOf(LF); at >= 0; at = buffer.indexOf(LF)) {
+    const line = buffer.slice(0, at).trim();
+    buffer = buffer.slice(at + 1);
+    if (line.length > 0) handle(JSON.parse(line));
+  }
+});
+function handle(message) {
+  if (message.id === undefined) return;
+  const { method, params = {} } = message;
+  if (method === 'initialize') return send({ jsonrpc: '2.0', id: message.id, result: {
+    protocolVersion: params.protocolVersion ?? '2024-11-05',
+    capabilities: { resources: {} },
+    serverInfo: { name: 'resource-only', version: '1.0.0' },
+  } });
+  if (method === 'resources/list') return send({ jsonrpc: '2.0', id: message.id, result: { resources: [{ uri: 'demo://only', name: 'only' }] } });
+  send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'unknown method ' + method } });
+}
+`)
+  writeFileSync(join(fixes.project, '.mcp.json'), JSON.stringify({
+    mcpServers: { docs: { command: process.execPath, args: [fixes.server] } },
+  }), 'utf8')
+  const { session } = makeSession(fixes)
+  await session.sync()
+  await session.refreshCatalog()
+
+  const catalog = session.pool.get('docs')?.catalog
+  expect(catalog?.tools).toEqual([])
+  expect(catalog?.resources.map((resource) => resource.uri)).toEqual(['demo://only'])
+})

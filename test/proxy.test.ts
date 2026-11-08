@@ -14,7 +14,7 @@ describe('proxy surface', () => {
   it('answers an unarmed session instead of throwing', async () => {
     const run = createProxyExecutor(() => undefined)
     const result = await run({}, {} as never)
-    expect(result.content[0].text).toBe('MCP is not initialized for this session yet.')
+    expect(firstText(result)).toBe('MCP is not initialized for this session yet.')
   })
 
   it('promotes every tool under directTools: true and hides them under "search"', () => {
@@ -162,8 +162,12 @@ function fakeSession(options: {
   return session
 }
 
-function firstText(result: { content: Array<{ text: string }> }): string {
-  return result.content[0].text
+function firstText(result: { content: ReadonlyArray<{ type: string; text?: string }> }): string {
+  const block = result.content[0]
+  if (block === undefined || block.type !== 'text' || typeof block.text !== 'string') {
+    throw new Error(`the first block is not text: ${JSON.stringify(block)}`)
+  }
+  return block.text
 }
 
 describe('PROXY_PARAMETERS', () => {

@@ -4,6 +4,15 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { boundedText, extractFields, prefixedToolName, projectResult, spillOutput, withTimeout } from '../src/util.ts'
 
+/** The text of one projected block; the projection can also emit host image blocks. */
+function textAt(blocks: ReadonlyArray<{ type: string; text?: string }>, index: number): string {
+  const block = blocks[index]
+  if (block === undefined || block.type !== 'text' || typeof block.text !== 'string') {
+    throw new Error(`block ${index} is not text: ${JSON.stringify(block)}`)
+  }
+  return block.text
+}
+
 describe('util', () => {
   it('prefixes a tool name and clamps it to 64 characters', () => {
     expect(prefixedToolName('demo', 'ping')).toBe('demo_ping')
@@ -17,7 +26,7 @@ describe('util', () => {
   it('projects a text result and marks structured content', () => {
     const blocks = projectResult({ content: [{ type: 'text', text: 'pong' }], structuredContent: { ok: true } })
     expect(blocks[0]).toEqual({ type: 'text', text: 'pong' })
-    expect(blocks[1].text).toContain('"ok": true')
+    expect(textAt(blocks, 1)).toContain('"ok": true')
   })
 
   it('truncates past the byte cap and says so', () => {
@@ -25,7 +34,7 @@ describe('util', () => {
   })
 
   it('stringifies a null content item instead of dropping it', () => {
-    expect(projectResult({ content: [null] })[0].text).toBe('null')
+    expect(textAt(projectResult({ content: [null] }), 0)).toBe('null')
   })
 
   it('passes through when the timeout is not a positive finite number', async () => {
@@ -34,7 +43,7 @@ describe('util', () => {
 
   it('prefixes structured content with a newline so it does not run into the text', () => {
     const blocks = projectResult({ content: [{ type: 'text', text: 'pong' }], structuredContent: { ok: true } })
-    expect(blocks[1].text.startsWith('\n')).toBe(true)
+    expect(textAt(blocks, 1).startsWith('\n')).toBe(true)
   })
 
   // `appendStructuredContent: false` is for a server whose `content` already says what the model
@@ -50,7 +59,7 @@ describe('util', () => {
 
     it('keeps structured content when there is no content to fall back on', () => {
       const blocks = projectResult({ content: [], structuredContent: { ok: true } }, false)
-      expect(blocks[0].text).toContain('"ok": true')
+      expect(textAt(blocks, 0)).toContain('"ok": true')
     })
 
     it('keeps both by default', () => {

@@ -6,6 +6,7 @@
 // activate them, which is the middle path pi-mcp-adapter offers.
 
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+import type { ImageAdmission } from './media.ts'
 import type { CatalogTool, ServerConfig, ToolRunLike } from './types.ts'
 import { projectResult } from './util.ts'
 
@@ -69,7 +70,12 @@ export function directToolDefinition(
   callApproved: (name: string, args: unknown, exec: ToolRunLike | undefined) => Promise<unknown>,
   isActive: () => boolean = () => true,
   appendStructuredContent: () => boolean = () => true,
+  admitImages: (result: unknown, exec: ToolRunLike | undefined) => Promise<ImageAdmission | undefined> = async () => undefined,
 ): ToolDefinition {
+  // What `admitImages` produced for the call in flight. One tool definition serves one model call at
+  // a time only if the tool is exclusive (it is: `isConcurrencySafe` is not declared), and the value
+  // has to survive from `execute` to `render`, which DSH calls synchronously right after it.
+  let admitted: ImageAdmission | undefined
   return {
     name: tool.name,
     // The source's trailing `${tool.description ? '' : ''}` contributes nothing and is kept verbatim.
@@ -78,14 +84,18 @@ export function directToolDefinition(
     parameters: sanitizeParameters(tool.inputSchema),
     output: {
       schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => projectResult(value, appendStructuredContent()),
+      render: (_args, value) => projectResult(value, appendStructuredContent(), admitted),
     },
     async execute(args, exec) {
       if (!isActive()) throw new Error(`MCP tool "${tool.name}" is not active — call mcp({ search: "${tool.originalName}" }) to activate it`)
+      admitted = undefined
       // Same gate as the proxy: a direct tool is not a way around approvals.
       const result = await callApproved(tool.name, args ?? {}, exec)
+      // `render` reads the admission, so it must be assigned before this returns — `output.render`
+      // runs on the returned value and is the only seam that can emit a host image block.
+      admitted = await admitImages(result, exec)
       if (reportsError(result)) {
-        const blocks = projectResult(result, appendStructuredContent())
+        const blocks = projectResult(result, appendStructuredContent(), admitted)
         return { content: blocks, value: result, isError: true }
       }
       return result

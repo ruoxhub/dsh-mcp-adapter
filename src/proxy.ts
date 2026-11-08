@@ -15,6 +15,7 @@
 import { describeTool, formatSearchPage, searchTools, summarizeParameters } from './catalog.ts'
 import { flattenPromptResult } from './prompts.ts'
 import type { PoolEntry, PoolStatus } from './servers.ts'
+import type { ImageAdmission } from './media.ts'
 import type { Catalog, CatalogTool, ContentBlock, ServerCatalog, ToolRunLike } from './types.ts'
 import { boundedText, extractFields, projectResult, spillOutput } from './util.ts'
 
@@ -114,6 +115,14 @@ export interface ProxySession {
   refreshCatalog: () => Promise<Catalog>
   /** The one gated call path: approval applied, then dispatch. */
   callApproved: (toolName: string, args: unknown, exec: ToolRunLike | undefined) => Promise<unknown>
+  /**
+   * Admit this result's image parts through the host's attachment store.
+   *
+   * Optional because a test session (or a composition without `ctx.attachments`) has no store to
+   * admit through; an absent capability keeps the text placeholder, which is what the host does when
+   * image admission is unavailable. See `src/media.ts`.
+   */
+  admitImages?: (result: unknown, exec: ToolRunLike | undefined) => Promise<ImageAdmission | undefined>
   /**
    * Make the direct tools a search matched callable; returns the ones it activated.
    *
@@ -353,7 +362,11 @@ async function callTool(session: ProxySession, name: string, args: unknown, serv
     if (reportsError(rawResult)) return errorResult(projectResult(rawResult, showStructured))
 
     const result = extract && extract.length > 0 ? extractFields(rawResult, extract) : rawResult
-    const blocks = projectResult(result, showStructured)
+    // Admission runs here, where the call already waited for the server: `output.render` is pure and
+    // synchronous, so it cannot store bytes. An image that is refused keeps a text block that names
+    // the reason (see `imageDiagnostic`).
+    const images = await session.admitImages?.(rawResult, exec)
+    const blocks = projectResult(result, showStructured, images)
     await spillOversized(session, blocks, tool.originalName)
 
     return { content: blocks, value: result }

@@ -1245,3 +1245,108 @@ it('reconnects once when a legacy HTTP session expires and retries the call', as
   // A replacement session was minted, so the retry really went out on a new connection.
   expect(minted).toBeGreaterThanOrEqual(2)
 })
+
+// P1-4 (ADR-0011): an MCP tool that returns a screenshot must reach the model as an image.
+//
+// The old projection turned every `{ type: 'image' }` MCP content part into
+// "[image image/png — N bytes omitted]", so a browser-automation server's whole output was a
+// placeholder. The host already stores images durably and decides whether the current model route
+// accepts them; this drives a real stdio server through the real registry with those services
+// mounted, so the assertion is on the blocks the model would actually see.
+const IMAGE_TOOL_SERVER_SOURCE = `
+const LF = String.fromCharCode(10);
+const send = (message) => process.stdout.write(JSON.stringify(message) + LF);
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (let at = buffer.indexOf(LF); at >= 0; at = buffer.indexOf(LF)) {
+    const line = buffer.slice(0, at).trim();
+    buffer = buffer.slice(at + 1);
+    if (line.length > 0) handle(JSON.parse(line));
+  }
+});
+// A one-pixel PNG: real bytes, so the host's image validation has something to decode.
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+function handle(message) {
+  if (message.id === undefined) return;
+  const { method, params = {} } = message;
+  if (method === 'initialize') return send({ jsonrpc: '2.0', id: message.id, result: {
+    protocolVersion: params.protocolVersion ?? '2024-11-05',
+    capabilities: { tools: {} },
+    serverInfo: { name: 'shots', version: '1.0.0' },
+  } });
+  if (method === 'tools/list') return send({ jsonrpc: '2.0', id: message.id, result: { tools: [
+    { name: 'screenshot', description: 'Take a screenshot.', inputSchema: { type: 'object', properties: {} } },
+  ] } });
+  if (method === 'tools/call') return send({ jsonrpc: '2.0', id: message.id, result: { content: [
+    { type: 'text', text: 'captured' },
+    { type: 'image', data: PNG, mimeType: 'image/png' },
+  ] } });
+  send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'unknown method ' + method } });
+}
+`
+
+it('an image an MCP tool returns reaches the model as an image block', async () => {
+  const fixes = fixture(IMAGE_TOOL_SERVER_SOURCE)
+  writeFileSync(join(fixes.project, '.mcp.json'), JSON.stringify({
+    mcpServers: { shots: { command: process.execPath, args: [fixes.server], directTools: true } },
+  }), 'utf8')
+
+  const root = new Context()
+  root.provide('systemPrompt', {
+    tools: () => () => {},
+    section: () => () => {},
+    variable: () => () => {},
+    sectionFor: () => () => {},
+  })
+  new ToolRuntime(root)
+  // The two host services image admission needs, with the exact shapes `src/media.ts` reads.
+  const saved: Array<{ mediaType: string; bytes: number }> = []
+  root.provide('attachments', {
+    saveImages: async (inputs: Array<{ data: Uint8Array; mediaType: string }>) => {
+      saved.push(...inputs.map((input) => ({ mediaType: input.mediaType, bytes: input.data.byteLength })))
+      return inputs.map((_input, index) => ({ attachmentId: `att-${index}`, mediaType: _input.mediaType }))
+    },
+  })
+  root.provide('llm', {
+    resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }),
+  })
+
+  const agent = {
+    id: 'agent-image',
+    // The route the image decision reads; the model declares image input, so nothing is refused.
+    options: { provider: 'test', model: 'vision' },
+    session: {
+      header: { cwd: fixes.project },
+      requestHeader: () => ({ config: { provider: 'test', model: 'vision' } }),
+    },
+    ctx: root,
+  }
+  const session = new McpSession({
+    ctx: root as never,
+    agent: agent as never,
+    settings: { ...DEFAULT_SETTINGS, dshHome: fixes.home, servers: {}, configFiles: [], projectServers: 'allow' },
+    logger: { debug() {}, warn() {} },
+    stat: statSync,
+  })
+  cleanups.push(() => session.dispose())
+  await session.sync()
+  session.registerTools()
+  await session.refreshCatalog()
+
+  const outcome = await root.tools.execute({
+    callId: ToolCallId('call-image'),
+    name: 'shots_screenshot',
+    arguments: {},
+    signal: new AbortController().signal,
+  })
+  if (outcome.isError) throw new Error(`the screenshot call failed: ${outcome.error.message}`)
+
+  // The text survives and the image is a real image block, not a placeholder.
+  expect(outcome.content[0]).toEqual({ type: 'text', text: 'captured' })
+  expect(outcome.content[1]?.type).toBe('image')
+  // The bytes really went through the host store, in the server's own media type.
+  expect(saved).toEqual([{ mediaType: 'image/png', bytes: expect.any(Number) as number }])
+  expect(saved[0].bytes).toBeGreaterThan(0)
+})

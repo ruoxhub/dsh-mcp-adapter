@@ -1,5 +1,7 @@
-// Cross-module interfaces. Pure declarations: this file imports nothing, so every module can
-// depend on it without creating a cycle.
+// Cross-module interfaces. Pure declarations: the only import is a type-only alias for the host's
+// content-block union, which creates no cycle and no runtime dependency.
+
+import type { ContentBlock as HostContentBlock } from '@deepseek-ai/dsh-llm'
 
 /**
  * One normalized server definition, exactly as `normalizeEntry` returns it.
@@ -87,10 +89,15 @@ export interface HttpRequestHeadersCommand {
 }
 
 /** The only block shape this adapter emits: images and resources become text descriptions. */
-export interface ContentBlock {
-  type: 'text'
-  text: string
-}
+/**
+ * One model-facing block this adapter emits — the host's own content vocabulary.
+ *
+ * Aliased rather than re-declared so an admitted image is a real `ImageBlock` (its `attachment` is
+ * the host's branded durable reference, which this package cannot name: `@deepseek-ai/dsh-attachment`
+ * is not a dependency). A hand-rolled structural copy would typecheck here and then fail at the tool
+ * boundary, where `output.render` promises the host's exact union.
+ */
+export type ContentBlock = HostContentBlock
 
 /** The hints the adapter reads off an MCP tool; anything else on the server's object is ignored. */
 export interface ToolAnnotations {

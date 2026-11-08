@@ -3,6 +3,7 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { imageDiagnostic } from './media.ts'
 import type { ContentBlock } from './types.ts'
 
 /** Reject when `promise` does not settle within `ms`; the underlying work is left to finish. */
@@ -56,21 +57,44 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Parse one MCP `tools/call` result into dsh text blocks.
+ * Parse one MCP `tools/call` result into model-facing blocks.
+ *
+ * `images` carries what `admitResultImages()` managed to store for this result. A content index in
+ * `admitted` becomes a real image block; one in `refused` becomes a text block naming the reason; an
+ * index absent from both keeps the old placeholder. Taking it as an argument (rather than reading
+ * host services here) is what lets the synchronous `render` seam stay pure and replayable.
+ *
  * @param result - the server's `CallToolResult`.
  * @param appendStructuredContent - `false` shows the model only `content` when the server sent
  *   any; `structuredContent` is still shown when `content` is empty, because otherwise the call
  *   would look like it returned nothing at all. This is pi-mcp-adapter's `appendStructuredContent`
  *   semantics, and the field was previously normalized here and then never read.
+ * @param images - admission outcome per content index; see {@link ImageAdmission}.
  */
-export function projectResult(result: unknown, appendStructuredContent = true): ContentBlock[] {
+export function projectResult(
+  result: unknown,
+  appendStructuredContent = true,
+  images?: { admitted: ReadonlyMap<number, unknown>; refused: ReadonlyMap<number, string> },
+): ContentBlock[] {
   const blocks: ContentBlock[] = []
   const content: unknown[] = isRecord(result) && Array.isArray(result.content) ? result.content : []
-  for (const item of content) {
+  for (const [index, item] of content.entries()) {
     const record = isRecord(item) ? item : undefined
     if (record?.type === 'text' && typeof record.text === 'string') blocks.push({ type: 'text', text: record.text })
     else if (record?.type === 'image' && typeof record.data === 'string') {
-      blocks.push({ type: 'text', text: `[image ${record.mimeType ?? 'unknown'} — ${Math.round((record.data.length * 3) / 4)} bytes omitted]` })
+      // Admitted images were stored by the host; reaching this branch with an index in `refused`
+      // means admission ran and declined, so the reason replaces the old placeholder.
+      const admitted = images?.admitted.get(index)
+      if (admitted !== undefined) blocks.push(admitted as ContentBlock)
+      else {
+        const refused = images?.refused.get(index)
+        blocks.push({
+          type: 'text',
+          text: refused === undefined
+            ? `[image ${record.mimeType ?? 'unknown'} — ${Math.round((record.data.length * 3) / 4)} bytes omitted]`
+            : imageDiagnostic(typeof record.mimeType === 'string' ? record.mimeType : undefined, refused),
+        })
+      }
     } else if (record?.type === 'resource' && isRecord(record.resource) && record.resource.uri) {
       blocks.push({ type: 'text', text: `[resource ${record.resource.uri}]` })
     } else if (item !== undefined) {

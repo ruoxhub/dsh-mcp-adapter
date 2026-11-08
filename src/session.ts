@@ -16,6 +16,8 @@ import type { BuildCatalogEntry } from './catalog.ts'
 import { isDisabledEntry, loadConfig } from './config.ts'
 import type { AdapterSettings } from './config.ts'
 import { directToolDefinition, resolveDirectTools } from './direct.ts'
+import { admitResultImages } from './media.ts'
+import type { ImageAdmission } from './media.ts'
 import { flattenPromptResult, parsePromptArgs, promptCommandName } from './prompts.ts'
 import { createProxyExecutor, PROXY_DESCRIPTION, PROXY_PARAMETERS, PROXY_TOOL_NAME } from './proxy.ts'
 import type { SpillStoreLike } from './proxy.ts'
@@ -136,22 +138,28 @@ function pickPolicySettings(settings: McpSessionSettings): Pick<AdapterSettings,
 /**
  * The source's `value?.content ?? [{ type: 'text', text: String(value ?? '') }]`.
  *
- * `createProxyExecutor` always returns `{ content: ContentBlock[] }` and this adapter's
- * `ContentBlock` is text-only, so the array case is narrowed block by block instead of handed to
- * the tool contract unvalidated. Anything else — a value with no usable `content`, which the proxy
- * never produces — renders as its string form, exactly as the source's fallback did.
+ * `createProxyExecutor` always returns `{ content: ContentBlock[] }`; this narrows the array block by
+ * block instead of handing it to the tool contract unvalidated, so a malformed value still renders as
+ * text. Admitted images are blocks too — they carry the host's own attachment reference, whose shape
+ * only the host's `ImageBlock` can vouch for, so they pass through untouched.
+ * Anything else — a value with no usable `content`, which the proxy never produces — renders as its
+ * string form, exactly as the source's fallback did.
  */
 function proxyBlocks(value: unknown): ContentBlock[] {
   const content = isObjectLike(value) ? value.content : undefined
-  if (isTextBlocks(content)) return content
+  if (isContentBlocks(content)) return content
   return [{ type: 'text', text: String(value ?? '') }]
 }
 
-/** Whether a value is a list of text blocks, the only block shape this adapter emits. */
-function isTextBlocks(value: unknown): value is ContentBlock[] {
+/** Whether a value is a list of the block shapes this adapter emits: text, or an admitted image. */
+function isContentBlocks(value: unknown): value is ContentBlock[] {
   if (!Array.isArray(value)) return false
   const blocks: unknown[] = value
-  return blocks.every((block) => isObjectLike(block) && block.type === 'text' && typeof block.text === 'string')
+  return blocks.every((block) => {
+    if (!isObjectLike(block)) return false
+    if (block.type === 'text') return typeof block.text === 'string'
+    return block.type === 'image' && block.attachment !== undefined
+  })
 }
 
 export class McpSession {
@@ -474,6 +482,22 @@ export class McpSession {
     }
   }
 
+  /**
+   * Admit one MCP result's image parts through the host's services.
+   *
+   * Both services are read with `required = false`: a composition without an attachment store (or
+   * without the model registry) must keep working, and it does — every refusal becomes a text block
+   * naming the reason, never a failed tool call.
+   */
+  admitImages(result: unknown, exec: ToolRunLike | undefined): Promise<ImageAdmission | undefined> {
+    return admitResultImages(result, {
+      attachments: this.ctx.get?.('attachments', false),
+      llm: this.ctx.get?.('llm', false),
+      agent: this.agent,
+      ...(exec?.signal === undefined ? {} : { signal: exec.signal }),
+    })
+  }
+
   /** Register the proxy tool and, for servers that asked for them, direct tools. */
   registerTools(): void {
     this.toolsRegistered = true
@@ -580,6 +604,7 @@ export class McpSession {
         (toolName, args, exec) => this.callApproved(toolName, args, exec),
         () => this.activated.has(name),
         () => this.appendStructuredContent(spec.tool.server),
+        (result, exec) => this.admitImages(result, exec),
       ))
       this.directDisposers.set(name, dispose)
     }

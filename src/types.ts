@@ -16,7 +16,18 @@ export interface ServerConfig {
   args: string[]
   env: Record<string, string>
   inheritEnv: boolean
-  cwd: string
+  /**
+   * The working directory the entry asked for, exactly as its config file wrote it.
+   *
+   * Absent unless the file declared one, and never filled in from the session directory here: this
+   * field is part of *what runs*, so it enters `definitionHash`, and defaulting it would make one
+   * user-global server hash differently in every workspace — its approval and its cached catalog
+   * would then belong to whichever folder happened to load it, and two workspaces would evict each
+   * other's entry. A relative value stays relative for the same reason: it means "inside whatever
+   * directory the session is in", which only the pool knows at connect time. `ServerPool` resolves
+   * it against its own `cwd` when it spawns the server.
+   */
+  cwd?: string
   url?: string
   socket?: string
   headers: Record<string, string>
@@ -57,6 +68,8 @@ export interface ServerConfig {
   autoApprove?: unknown
   exposeResources: boolean
   appendStructuredContent: boolean
+  roots?: boolean
+  requestHeadersCommand?: HttpRequestHeadersCommand
   description?: string
   toolPrefix?: string
   httpTransport?: string
@@ -64,6 +77,13 @@ export interface ServerConfig {
   debug: boolean
   /** Only the "disabled" early return sets this; no other entry carries it. */
   disabled?: true
+}
+
+export interface HttpRequestHeadersCommand {
+  command: string
+  args?: string[]
+  env?: Record<string, string>
+  timeoutMs?: number
 }
 
 /** The only block shape this adapter emits: images and resources become text descriptions. */
@@ -87,9 +107,27 @@ export interface CatalogTool {
   originalName: string
   description: string
   inputSchema: unknown
-  outputSchema: unknown
+  /** Whether the server declared an output schema. The schema itself is never retained: the SDK
+   * validates results from its own `tools/list` cache, so keeping a copy only inflates the persisted
+   * catalog by megabytes. */
+  hasOutputSchema: boolean
   annotations?: ToolAnnotations
   keywords: string[]
+  /** Lowercased names, description, keywords and the parameter summary, computed once by
+   * `buildCatalog`. Optional so hand-built catalogs still work; `searchTools` derives them on the
+   * fly when absent. */
+  search?: CatalogToolSearchFields
+}
+
+/** Fields `searchTools` needs in lowercase, precomputed at catalog build time. */
+export interface CatalogToolSearchFields {
+  name: string
+  originalName: string
+  server: string
+  description: string
+  normalizedName: string
+  keywords: string[]
+  parameters: string | null
 }
 
 /** One MCP resource, keyed by its prefixed name. */
@@ -111,15 +149,16 @@ export interface CatalogPrompt {
 
 /**
  * One tool exactly as a server reports it, before prefixing. `fetchCatalog` copies these fields off
- * the MCP tool and defaults the description; the schemas stay `unknown` because they are the
- * server's own JSON Schema, passed through untouched.
+ * the MCP tool and defaults the description; `inputSchema` stays `unknown` because it is the
+ * server's own JSON Schema, passed through untouched. `outputSchema` is reduced to a presence flag:
+ * the SDK validates results from its own `tools/list` cache and never reads our copy.
  */
 export interface ServerTool {
   name: string
   title?: string
   description?: string
   inputSchema?: unknown
-  outputSchema?: unknown
+  hasOutputSchema?: boolean
   annotations?: ToolAnnotations
 }
 

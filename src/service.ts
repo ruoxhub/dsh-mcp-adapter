@@ -6,11 +6,11 @@ import { basename, dirname, join, resolve } from 'node:path'
 import {
   adapterHome,
   DEFAULT_SETTINGS,
-  findProjectRoot,
   isDisabledEntry,
   normalizeEntry,
   parseJsonText,
   resolveDshHome,
+  resolveProjectRoot,
   SERVER_NAME_PATTERN,
 } from './config.ts'
 import { getKnownPreset, type KnownServerPreset, listKnownPresets, listCatalogEntries } from './presets.ts'
@@ -152,7 +152,7 @@ function toServerDetail(
     status = 'idle'
   } else if (scope === 'workspace') {
     try {
-      const normalized = normalizeEntry(name, raw, { projectRoot: ctx.projectRoot })
+      const normalized = normalizeEntry(name, raw)
       if (!isDisabledEntry(normalized)) {
         // The row reports the gate the session actually applies, so `allow` has to be consulted
         // here too: reading the approval record alone would label a server "blocked" while the
@@ -227,6 +227,13 @@ export interface WorkspaceOption {
   title: string
 }
 
+/** A refusal the web route reports as its own status instead of a 500. */
+function badRequest(message: string): Error {
+  const error = new Error(message) as Error & { statusCode?: number }
+  error.statusCode = 400
+  return error
+}
+
 export interface McpServersServiceOptions {
   dshHome?: string
   /**
@@ -242,21 +249,60 @@ export interface McpServersServiceOptions {
   workspaces?: () => WorkspaceOption[]
   /**
    * Optional eviction hook to close/evict running connections from active pools.
+   *
+   * `projectRoot` says which pools the write concerned: absent for a user-global write (the
+   * definition is shared by every workspace, so every pool must drop it), and the workspace root
+   * for a workspace write (another workspace's pool may run a same-named server of its own, and
+   * dropping that one would kill a connection nothing touched).
    */
-  onEvictServer?: (name: string) => Promise<void> | void
+  onEvictServer?: (name: string, projectRoot?: string) => Promise<void> | void
 }
 
 export class McpServersService {
   private readonly dshHome: string
   private readonly projectServers: 'ask' | 'allow' | 'deny'
   private readonly registeredWorkspaces?: () => WorkspaceOption[]
-  private readonly onEvictServer?: (name: string) => Promise<void> | void
+  private readonly onEvictServer?: (name: string, projectRoot?: string) => Promise<void> | void
 
   constructor(options?: McpServersServiceOptions) {
     this.dshHome = options?.dshHome ?? resolveDshHome()
     this.projectServers = options?.projectServers ?? DEFAULT_SETTINGS.projectServers
     this.registeredWorkspaces = options?.workspaces
     this.onEvictServer = options?.onEvictServer
+  }
+
+  /**
+   * Resolve the workspace a panel request names.
+   *
+   * The panel's `cwd` arrives from the browser, so it cannot be trusted to be *the* project; but a
+   * session may legitimately live outside every registered workspace (DSH creates sessions from a
+   * bare `cwd` too), so this refuses only the two things it can name definitively:
+   *
+   * 1. A directory inside a registered workspace resolves to that registered path, not to a `.git`
+   *    ancestor. The registry is what DSH treated as the project, and a subdirectory of a
+   *    repository is its own workspace there.
+   * 2. Anything else keeps the old `findProjectRoot` resolution.
+   *
+   * No directory at all resolves to `''`: the caller then reads user-global config only, instead of
+   * silently adopting the harness process' own launch directory.
+   * @param cwd - the request's directory, if it named one.
+   * @returns the project root, or `''` when the request named no directory.
+   */
+  resolveTarget(cwd: string | undefined): string {
+    if (cwd === undefined || cwd.trim() === '') return ''
+    return resolveProjectRoot(cwd.trim(), this.registered().map((item) => item.path))
+  }
+
+  /** The registry's entries, or none when the registry is absent or throws. */
+  private registered(): WorkspaceOption[] {
+    try {
+      return (this.registeredWorkspaces?.() ?? []).filter(
+        (item): item is WorkspaceOption => typeof item?.path === 'string' && item.path.trim() !== '',
+      )
+    } catch {
+      // An unavailable registry leaves the active root as the only known workspace.
+      return []
+    }
   }
 
   /**
@@ -268,16 +314,10 @@ export class McpServersService {
    * only when absent, never promoted.
    */
   private resolveWorkspaces(activeRoot: string): WorkspaceOption[] {
-    let registered: WorkspaceOption[] = []
-    try {
-      registered = (this.registeredWorkspaces?.() ?? []).filter(
-        (item): item is WorkspaceOption => typeof item?.path === 'string' && item.path.trim() !== '',
-      )
-    } catch {
-      // An unavailable registry leaves the active root as the only known workspace.
-    }
+    const registered = this.registered()
     const out: WorkspaceOption[] = []
     const add = (path: string, title: unknown): void => {
+      if (path === '') return
       const resolved = resolve(path)
       if (out.some((item) => resolve(item.path) === resolved)) return
       out.push({
@@ -298,8 +338,7 @@ export class McpServersService {
     workspaceRoot: string
     workspaces: WorkspaceOption[]
   }> {
-    const effectiveCwd = resolve(options.cwd ?? process.cwd())
-    const workspaceRoot = findProjectRoot(effectiveCwd)
+    const workspaceRoot = this.resolveTarget(options.cwd)
     const workspaces = this.resolveWorkspaces(workspaceRoot)
     const servers: McpServerDetail[] = []
 
@@ -316,8 +355,9 @@ export class McpServersService {
       }
     }
 
-    // Workspace scope
-    if (options.scope !== 'user') {
+    // Workspace scope. With no resolved workspace there is no project file to read; a relative
+    // `.mcp.json` would resolve against the harness process' own directory.
+    if (options.scope !== 'user' && workspaceRoot !== '') {
       const wsPath = join(workspaceRoot, '.mcp.json')
       const wsJson = safeReadJson(wsPath)
       const rawServers = wsJson?.mcpServers ?? wsJson?.servers
@@ -347,8 +387,9 @@ export class McpServersService {
       throw new Error(`Invalid server name: "${options.name}". Name must match ${SERVER_NAME_PATTERN}`)
     }
 
-    const effectiveCwd = options.cwd ? resolve(options.cwd) : process.cwd()
-    const workspaceRoot = findProjectRoot(effectiveCwd)
+    // Both ends of a scope change live in the same workspace file, so either end needs the root.
+    const touchesWorkspace = options.scope === 'workspace' || options.originalScope === 'workspace'
+    const workspaceRoot = this.workspaceRootFor(options.cwd, touchesWorkspace)
     const targetPath = options.scope === 'user'
       ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
       : join(workspaceRoot, '.mcp.json')
@@ -414,7 +455,7 @@ export class McpServersService {
     // User explicit save of workspace server counts as user trust -> auto-approve
     if (options.scope === 'workspace') {
       try {
-        const normalized = normalizeEntry(options.name, options.server, { projectRoot: workspaceRoot })
+        const normalized = normalizeEntry(options.name, options.server)
         if (!isDisabledEntry(normalized)) {
           approve(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, options.name, normalized)
         }
@@ -423,11 +464,14 @@ export class McpServersService {
       }
     }
 
+    // A workspace write only concerns that workspace's pools; a user-global write concerns all.
+    const evictScope = touchesWorkspace ? workspaceRoot : undefined
+
     // Evict old identity from cache & pool if renamed or moved
     if (isRename || isScopeChange) {
       purgeCacheEntry(cachePath(adapterHome(this.dshHome)), prevName)
       try {
-        await this.onEvictServer?.(prevName)
+        await this.onEvictServer?.(prevName, evictScope)
       } catch {
         // Eviction errors do not fail the save
       }
@@ -436,7 +480,7 @@ export class McpServersService {
     // Invalidate new server cache & running connection so changes take effect immediately
     purgeCacheEntry(cachePath(adapterHome(this.dshHome)), options.name)
     try {
-      await this.onEvictServer?.(options.name)
+      await this.onEvictServer?.(options.name, evictScope)
     } catch {
       // Eviction errors do not fail the save
     }
@@ -445,21 +489,41 @@ export class McpServersService {
   }
 
   /**
+   * The project root a workspace-scoped operation writes to.
+   *
+   * A workspace write without a directory is refused instead of being aimed at the harness process'
+   * own working directory: the panel always has the session's workspace, so a request that lacks
+   * one is a programming error, not a request to write somewhere real.
+   * @param cwd - the request's directory, if it named one.
+   * @returns the project root.
+   * @throws an error with `statusCode: 400` when no workspace could be resolved.
+   */
+  private requireWorkspaceRoot(cwd: string | undefined): string {
+    const root = this.resolveTarget(cwd)
+    if (root === '') throw badRequest('Workspace scope needs the session workspace directory; the request named none')
+    return root
+  }
+
+  /** The project root a save/delete/toggle needs, or `''` when the operation stays in user scope. */
+  private workspaceRootFor(cwd: string | undefined, touchesWorkspace: boolean): string {
+    return touchesWorkspace ? this.requireWorkspaceRoot(cwd) : ''
+  }
+
+  /**
    * Approve a project/workspace server by recording its definition hash.
    */
   async approveServer(options: { cwd?: string; name: string }): Promise<{ ok: boolean }> {
-    const effectiveCwd = resolve(options.cwd ?? process.cwd())
-    const workspaceRoot = findProjectRoot(effectiveCwd)
+    const workspaceRoot = this.requireWorkspaceRoot(options.cwd)
     const wsPath = join(workspaceRoot, '.mcp.json')
     const wsJson = safeReadJson(wsPath)
     const rawServers = wsJson?.mcpServers ?? wsJson?.servers
 
     if (!isRecord(rawServers) || !rawServers[options.name]) {
-      throw new Error(`Server "${options.name}" not found in workspace at ${effectiveCwd}`)
+      throw new Error(`Server "${options.name}" not found in workspace at ${workspaceRoot}`)
     }
 
     const raw = rawServers[options.name]
-    const normalized = normalizeEntry(options.name, raw, { projectRoot: workspaceRoot })
+    const normalized = normalizeEntry(options.name, raw)
     if (isDisabledEntry(normalized)) {
       throw new Error(`Server "${options.name}" is disabled in config, so it needs no approval`)
     }
@@ -472,8 +536,7 @@ export class McpServersService {
    * Delete an MCP server from the specified scope.
    */
   async deleteServer(options: { scope: Scope; cwd?: string; name: string }): Promise<{ ok: boolean }> {
-    const effectiveCwd = options.cwd ? resolve(options.cwd) : process.cwd()
-    const workspaceRoot = findProjectRoot(effectiveCwd)
+    const workspaceRoot = this.workspaceRootFor(options.cwd, options.scope === 'workspace')
     const targetPath = options.scope === 'user'
       ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
       : join(workspaceRoot, '.mcp.json')
@@ -498,10 +561,11 @@ export class McpServersService {
       removeApproval(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, options.name)
     }
 
-    // Invalidate disk cache and evict running process from ServerPool
+    // Invalidate disk cache and evict running process from ServerPool. A workspace delete drops
+    // only that workspace's pools; a user-global delete drops the definition every pool shares.
     purgeCacheEntry(cachePath(adapterHome(this.dshHome)), options.name)
     try {
-      await this.onEvictServer?.(options.name)
+      await this.onEvictServer?.(options.name, options.scope === 'workspace' ? workspaceRoot : undefined)
     } catch {
       // Eviction errors do not fail the delete
     }
@@ -521,8 +585,7 @@ export class McpServersService {
     if (options.fromScope === options.toScope) {
       return { ok: true }
     }
-    const effectiveCwd = options.cwd ? resolve(options.cwd) : process.cwd()
-    const workspaceRoot = findProjectRoot(effectiveCwd)
+    const workspaceRoot = this.workspaceRootFor(options.cwd, true)
 
     const fromPath = options.fromScope === 'user'
       ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
@@ -573,7 +636,7 @@ export class McpServersService {
     }
     if (options.toScope === 'workspace') {
       try {
-        const normalized = normalizeEntry(options.name, serverConfig, { projectRoot: workspaceRoot })
+        const normalized = normalizeEntry(options.name, serverConfig)
         if (!isDisabledEntry(normalized)) {
           approve(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, options.name, normalized)
         }
@@ -582,10 +645,11 @@ export class McpServersService {
       }
     }
 
-    // 6. Invalidate cache and evict running process
+    // 6. Invalidate cache and evict running process. A migration touches the workspace file, so
+    // its pools are the ones that must reconnect; the user-global end is shared and is not.
     purgeCacheEntry(cachePath(adapterHome(this.dshHome)), options.name)
     try {
-      await this.onEvictServer?.(options.name)
+      await this.onEvictServer?.(options.name, workspaceRoot)
     } catch {
       // ignore
     }
@@ -701,8 +765,7 @@ export class McpServersService {
       server: serverDef,
     })
 
-    const effectiveCwd = options.cwd ? resolve(options.cwd) : process.cwd()
-    const workspaceRoot = findProjectRoot(effectiveCwd)
+    const workspaceRoot = this.workspaceRootFor(options.cwd, options.scope === 'workspace')
     const targetPath = options.scope === 'user'
       ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
       : join(workspaceRoot, '.mcp.json')
@@ -723,8 +786,7 @@ export class McpServersService {
     cwd?: string
     enabled: boolean
   }): Promise<{ ok: boolean; enabled: boolean }> {
-    const effectiveCwd = options.cwd ? resolve(options.cwd) : process.cwd()
-    const workspaceRoot = findProjectRoot(effectiveCwd)
+    const workspaceRoot = this.workspaceRootFor(options.cwd, options.scope === 'workspace')
     const targetPath = options.scope === 'user'
       ? join(this.dshHome, 'mcp-adapter', 'mcp.json')
       : join(workspaceRoot, '.mcp.json')
@@ -756,9 +818,9 @@ export class McpServersService {
     safeWriteJson(targetPath, data)
 
     if (!options.enabled) {
-      // Evict running process from pool
+      // Evict running process from pool, scoped to the workspace the entry was switched off in.
       try {
-        await this.onEvictServer?.(options.name)
+        await this.onEvictServer?.(options.name, options.scope === 'workspace' ? workspaceRoot : undefined)
       } catch {
         // Eviction errors do not fail the toggle
       }
@@ -767,7 +829,7 @@ export class McpServersService {
       purgeCacheEntry(cachePath(adapterHome(this.dshHome)), options.name)
       if (options.scope === 'workspace') {
         try {
-          const normalized = normalizeEntry(options.name, serverDef, { projectRoot: workspaceRoot })
+          const normalized = normalizeEntry(options.name, serverDef)
           if (!isDisabledEntry(normalized)) {
             approve(approvalsPath(adapterHome(this.dshHome)), workspaceRoot, options.name, normalized)
           }
@@ -784,9 +846,9 @@ export class McpServersService {
    * Scan host machine and external AI coding tools for MCP configurations.
    */
   scanExternal(options: { cwd?: string } = {}): ExternalMcpScanResult {
-    const effectiveCwd = resolve(options.cwd ?? process.cwd())
-    const workspaceRoot = findProjectRoot(effectiveCwd)
-    return scanExternalMcp({ projectPath: workspaceRoot })
+    // No project named means no project files to scan; the machine-wide sources still are.
+    const workspaceRoot = this.resolveTarget(options.cwd)
+    return scanExternalMcp(workspaceRoot === '' ? {} : { projectPath: workspaceRoot })
   }
 
   /**

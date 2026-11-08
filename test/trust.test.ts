@@ -56,13 +56,13 @@ describe('trust', () => {
 
 describe('definitionHash', () => {
   it('is stable for the same definition', () => {
-    const one = normalizeEntry('demo', { command: 'npx', args: ['-y', 'a'], env: { TOKEN: 'one' } }, { projectRoot: '/repo' }) as ServerConfig
-    const two = normalizeEntry('demo', { command: 'npx', args: ['-y', 'a'], env: { TOKEN: 'one' } }, { projectRoot: '/repo' }) as ServerConfig
+    const one = normalizeEntry('demo', { command: 'npx', args: ['-y', 'a'], env: { TOKEN: 'one' } }) as ServerConfig
+    const two = normalizeEntry('demo', { command: 'npx', args: ['-y', 'a'], env: { TOKEN: 'one' } }) as ServerConfig
     expect(definitionHash(one)).toBe(definitionHash(two))
   })
 
   it('covers exactly the stdio fields that decide what runs', () => {
-    const base = normalizeEntry('demo', { command: 'npx', args: ['-y', 'a'], env: { TOKEN: 'one' } }, { projectRoot: '/repo' }) as ServerConfig
+    const base = normalizeEntry('demo', { command: 'npx', args: ['-y', 'a'], env: { TOKEN: 'one' } }) as ServerConfig
     const hash = definitionHash(base)
     expect(definitionHash({ ...base, command: 'node' })).not.toBe(hash)
     expect(definitionHash({ ...base, args: ['-y', 'b'] })).not.toBe(hash)
@@ -141,8 +141,8 @@ describe('approvals store', () => {
   it('replaces an existing record for the same project and server instead of appending a duplicate', () => {
     const home = temp()
     const file = approvalsPath(home)
-    const first = normalizeEntry('demo', { command: 'npx', args: ['a'] }, { projectRoot: '/repo' }) as ServerConfig
-    const second = normalizeEntry('demo', { command: 'npx', args: ['b'] }, { projectRoot: '/repo' }) as ServerConfig
+    const first = normalizeEntry('demo', { command: 'npx', args: ['a'] }) as ServerConfig
+    const second = normalizeEntry('demo', { command: 'npx', args: ['b'] }) as ServerConfig
     approve(file, '/repo', 'demo', first)
     approve(file, '/repo', 'demo', second)
     const store = JSON.parse(readFileSync(file, 'utf8')) as { approvals: Array<{ serverName: string; definitionHash: string }> }
@@ -160,7 +160,7 @@ describe('approvals store', () => {
   it('replaces a malformed same-pair record instead of leaving a duplicate pair', () => {
     const home = temp()
     const file = approvalsPath(home)
-    const config = normalizeEntry('demo', { command: 'npx' }, { projectRoot: '/repo' }) as ServerConfig
+    const config = normalizeEntry('demo', { command: 'npx' }) as ServerConfig
     // A same-pair record whose hash is not a string: never a match, but still the same pair.
     writeFileSync(file, JSON.stringify({
       version: 1,
@@ -203,5 +203,28 @@ describe('partition policy', () => {
     const result = partition({ servers, projectRoot: '/repo', policy: 'ask', approvalsFile: approvalsPath(home) })
     expect(result.mount).toEqual([])
     expect(result.blocked).toEqual([])
+  })
+})
+
+describe('a definition carries no session directory', () => {
+  it('hashes one user-global server identically in every workspace', () => {
+    // What two different sessions normalize from the same file: identical, because nothing about a
+    // session was passed in. This is what lets one cached catalog and one approval record serve both.
+    const inA = normalizeEntry('codegraph', { command: 'codegraph', args: ['serve', '--mcp'] }) as ServerConfig
+    const inB = normalizeEntry('codegraph', { command: 'codegraph', args: ['serve', '--mcp'] }) as ServerConfig
+    expect(inA.cwd).toBeUndefined()
+    expect(definitionHash(inA)).toBe(definitionHash(inB))
+  })
+
+  it('still hashes a directory the config file actually wrote', () => {
+    const plain = normalizeEntry('demo', { command: 'node' }) as ServerConfig
+    const pinned = normalizeEntry('demo', { command: 'node', cwd: './servers' }) as ServerConfig
+    // A relative value stays relative: it means "inside the session's directory", so the definition
+    // reads the same in every checkout while the path it resolves to differs.
+    expect(pinned.cwd).toBe('./servers')
+    expect(definitionHash(pinned)).not.toBe(definitionHash(plain))
+    expect(definitionHash(pinned)).toBe(definitionHash(
+      normalizeEntry('demo', { command: 'node', cwd: './servers' }) as ServerConfig,
+    ))
   })
 })

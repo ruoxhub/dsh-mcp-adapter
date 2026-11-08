@@ -127,6 +127,12 @@ export interface ProxySession {
    * the search itself activates nothing, so the same refusal repeats forever.
    */
   activateMatches: (query: string) => string[]
+  /**
+   * Whether any direct tools are registered. `activateMatches` rescans the whole catalog, so a
+   * default session (`directTools: false`) skips it entirely. Omitted reads as `true` so a host
+   * that does not know keeps the activation behaviour.
+   */
+  hasDirectTools?: () => boolean
   /** Adapter state directory where spill files are stored. */
   home?: string
   /** Maximum character length of tool output before spilling to disk. */
@@ -194,8 +200,9 @@ export function createProxyExecutor(
       })
       // A search is also the activation gesture: `directTools: 'search'` hides its tools until one
       // matches, and this is the only call that ever unhides them. It runs regardless of paging, so
-      // a match on page two still becomes callable.
-      session.activateMatches(args.search)
+      // a match on page two still becomes callable. When no direct tools are registered the second
+      // full-catalog scan in activateMatches is a pure no-op, so skip it.
+      if (session.hasDirectTools?.() !== false) session.activateMatches(args.search)
       return text(formatSearchPage(page, args.search))
     }
 

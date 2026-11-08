@@ -3,7 +3,7 @@
 
 import { prefixedToolName } from './util.ts'
 import type { AdapterSettings } from './config.ts'
-import type { Catalog, CatalogTool, SearchItem, SearchPage, ServerCatalog, ServerConfig } from './types.ts'
+import type { Catalog, CatalogTool, CatalogToolSearchFields, SearchItem, SearchPage, ServerCatalog, ServerConfig } from './types.ts'
 
 /**
  * Anything object-shaped, arrays included. The source's own checks are `typeof x === 'object'` plus
@@ -31,19 +31,22 @@ export function buildCatalog(servers: Map<string, BuildCatalogEntry>, settings: 
     const config = entry.config
     const prefix = typeof config.toolPrefix === 'string' ? config.toolPrefix : typeof settings.toolPrefix === 'string' ? settings.toolPrefix : ''
     for (const tool of entry.catalog?.tools ?? []) {
-      if (config.includeTools && !matchesAny(tool.name, config.includeTools)) continue
-      if (config.excludeTools && matchesAny(tool.name, config.excludeTools)) continue
+      const candidates = getToolCandidates(tool.name, serverName, prefix)
+      if (config.includeTools && !matchesAny(candidates, config.includeTools)) continue
+      if (config.excludeTools && matchesAny(candidates, config.excludeTools)) continue
       const name = prefixedToolName(serverName, tool.name, prefix)
-      tools.set(name, {
+      const entry: CatalogTool = {
         name,
         server: serverName,
         originalName: tool.name,
         description: tool.description ?? '',
         inputSchema: tool.inputSchema,
-        outputSchema: tool.outputSchema,
+        hasOutputSchema: tool.hasOutputSchema === true,
         annotations: tool.annotations,
-        keywords: keywordsFor(config.searchKeywords, tool.name, name),
-      })
+        keywords: keywordsFor(config.searchKeywords, candidates),
+      }
+      entry.search = computeSearchFields(entry)
+      tools.set(name, entry)
     }
     if (config.exposeResources !== false && settings.exposeResources !== false) {
       for (const resource of entry.catalog?.resources ?? []) {
@@ -58,22 +61,80 @@ export function buildCatalog(servers: Map<string, BuildCatalogEntry>, settings: 
   return { tools, resources, prompts }
 }
 
-/** Include/exclude globs: `*` matches any run of characters, anything else must match exactly. */
-function matchesAny(name: string, patterns: string[]): boolean {
-  return patterns.some((pattern) => (pattern.includes('*') ? new RegExp(`^${pattern.split('*').map(escapeRegExp).join('.*')}$`).test(name) : pattern === name))
+/**
+ * Lowercase the fields `searchTools` scores on, once per catalog build instead of once per search.
+ * A hand-built `CatalogTool` without `search` still works: `searchTools` computes these lazily.
+ */
+export function computeSearchFields(tool: CatalogTool): CatalogToolSearchFields {
+  return {
+    name: tool.name.toLowerCase(),
+    originalName: tool.originalName.toLowerCase(),
+    server: tool.server.toLowerCase(),
+    description: tool.description.toLowerCase(),
+    normalizedName: tool.name.toLowerCase().replace(/[-_]/g, ''),
+    keywords: tool.keywords.map((keyword) => keyword.toLowerCase()),
+    parameters: summarizeParameters(tool.inputSchema),
+  }
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+/** Simple glob matching: `*` matches any run of characters, `?` matches a single character. */
+export function globToRegExp(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')
+  return new RegExp(`^${escaped}$`)
 }
 
-/** Per-server `searchKeywords`: exact name, prefixed name, or `*` for every tool. */
-function keywordsFor(configured: unknown, originalName: string, name: string): string[] {
+export function matchesPattern(candidate: string, pattern: string): boolean {
+  if (pattern.includes('*') || pattern.includes('?')) {
+    return globToRegExp(pattern).test(candidate)
+  }
+  return candidate === pattern
+}
+
+export function getToolCandidates(originalName: string, serverName: string, prefix: string): Set<string> {
+  const prefixed = prefixedToolName(serverName, originalName, prefix)
+  const candidates = new Set<string>([
+    originalName,
+    prefixed,
+    `${serverName}_${originalName}`,
+    `${serverName}.${originalName}`,
+  ])
+  const normalized = originalName.replace(/-/g, '_')
+  if (normalized !== originalName) {
+    candidates.add(normalized)
+    candidates.add(prefixedToolName(serverName, normalized, prefix))
+    candidates.add(`${serverName}_${normalized}`)
+  }
+  return candidates
+}
+
+/** Include/exclude globs: matches if any pattern matches any candidate name. */
+export function matchesAny(candidates: Set<string> | string, patterns: string[]): boolean {
+  const candidateSet = typeof candidates === 'string' ? new Set([candidates]) : candidates
+  for (const pattern of patterns) {
+    if (typeof pattern !== 'string') continue
+    for (const candidate of candidateSet) {
+      if (matchesPattern(candidate, pattern)) return true
+    }
+  }
+  return false
+}
+
+/** Per-server `searchKeywords`: exact name, prefixed name, glob pattern, or `*` for every tool. */
+function keywordsFor(configured: unknown, candidates: Set<string>): string[] {
   if (!isObjectLike(configured)) return []
   const out: string[] = []
   for (const [key, value] of Object.entries(configured)) {
-    if (key !== '*' && key !== originalName && key !== name) continue
-    if (Array.isArray(value)) out.push(...value.map(String))
+    if (!Array.isArray(value)) continue
+    if (key === '*') {
+      out.push(...value.map(String))
+      continue
+    }
+    for (const candidate of candidates) {
+      if (matchesPattern(candidate, key)) {
+        out.push(...value.map(String))
+        break
+      }
+    }
   }
   return out
 }
@@ -112,22 +173,20 @@ export function searchTools(catalog: Catalog, query: string, { limit = 12, offse
       // `query` may be any string, including one that is only whitespace: that is the empty search.
       scored = []
       for (const tool of candidates) {
-        const name = tool.name.toLowerCase()
-        const toolServer = tool.server.toLowerCase()
-        const description = tool.description.toLowerCase()
-        const keywords = tool.keywords.map((keyword) => keyword.toLowerCase())
+        // `buildCatalog` precomputes these; a hand-built CatalogTool derives them here once.
+        const fields = tool.search ?? (tool.search = computeSearchFields(tool))
         let score = 0
         let matchedAll = true
         for (const term of terms) {
           let termScore = 0
-          if (name === term || tool.originalName.toLowerCase() === term) termScore += 100
-          if (name.includes(term)) termScore += 40
+          if (fields.name === term || fields.originalName === term) termScore += 100
+          if (fields.name.includes(term)) termScore += 40
           // Hyphens and underscores are interchangeable, as in pi-mcp-adapter's fuzzy naming.
-          if (name.replace(/[-_]/g, '').includes(term.replace(/[-_]/g, ''))) termScore += 20
-          if (keywords.some((keyword) => keyword === term)) termScore += 30
-          if (keywords.some((keyword) => keyword.includes(term))) termScore += 10
-          if (description.includes(term)) termScore += 5
-          if (toolServer.includes(term)) termScore += 2
+          if (fields.normalizedName.includes(term.replace(/[-_]/g, ''))) termScore += 20
+          if (fields.keywords.some((keyword) => keyword === term)) termScore += 30
+          if (fields.keywords.some((keyword) => keyword.includes(term))) termScore += 10
+          if (fields.description.includes(term)) termScore += 5
+          if (fields.server.includes(term)) termScore += 2
           if (termScore === 0) matchedAll = false
           score += termScore
         }
@@ -143,7 +202,7 @@ export function searchTools(catalog: Catalog, query: string, { limit = 12, offse
     name: tool.name,
     server: tool.server,
     description: tool.description,
-    ...(includeSchemas ? { parameters: summarizeParameters(tool.inputSchema) } : {}),
+    ...(includeSchemas ? { parameters: (tool.search ?? (tool.search = computeSearchFields(tool))).parameters } : {}),
     ...(tool.annotations ? { annotations: tool.annotations } : {}),
   }))
   return { items, total, hasMore: offset + page.length < total, nextOffset: offset + page.length < total ? offset + page.length : null }

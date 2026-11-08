@@ -176,22 +176,31 @@ export function apply(ctx: Context, rawConfig?: Record<string, unknown>): void {
   // The panel's workspace list is the DSH workspace registry, read the same way skill-manager
   // does: non-strict, because a headless composition has no registry and must still mount.
   const registry = ctx.get('workspaceRegistry', false) as WorkspaceRegistrySurface | undefined
+  // One resolver for both halves: a session inside a registered workspace treats that workspace as
+  // its project, and the panel writes `.mcp.json` to the same directory.
+  const workspacePaths = (): string[] => listRegisteredWorkspaces(registry).map((item) => item.path)
   const service = new McpServersService({
     dshHome: settings.dshHome,
     projectServers: settings.projectServers,
     workspaces: () => listRegisteredWorkspaces(registry),
-    onEvictServer: async (name: string) => {
+    // A workspace write names the one root it touched; a user-global write names none and reaches
+    // every pool, because that definition is the one all workspaces share. Filtering here (rather
+    // than in the service) keeps the service free of session knowledge.
+    onEvictServer: async (name: string, projectRoot?: string) => {
       for (const agent of activeAgents) {
         const session = sessions.get(agent)
-        if (session) {
-          try {
-            await session.pool.remove(name)
-          } catch {
-            // ignore removal errors
-          }
-          session.catalogStale = true
-          await publish(agent)
+        if (!session) continue
+        if (projectRoot !== undefined && session.projectRoot !== projectRoot) continue
+        try {
+          await session.pool.remove(name)
+        } catch {
+          // ignore removal errors
         }
+        // The panel purged the disk entry; drop it from this session's snapshot too, or its next
+        // persistCache would write the stale catalog back (ADR-0010).
+        session.forgetCachedServer(name)
+        session.catalogStale = true
+        await publish(agent)
       }
     },
   })
@@ -200,7 +209,14 @@ export function apply(ctx: Context, rawConfig?: Record<string, unknown>): void {
   // returning undefined. Every optional service is therefore reached through `ctx.get(name, false)`.
   const webServer = ctx.get('webServer', false)
   if (webServer?.register) {
-    const webRoutes = createMcpWebRoutes(service)
+    // The fence needs the listener's own facts, which the webserver owns: the bind literal and the
+    // protocol it actually speaks. Both are read here rather than from a request, so no proxy or
+    // header can widen them. A webserver that exposes neither leaves them absent, and the fence
+    // then accepts only loopback Hosts — still closed, just narrower.
+    const webRoutes = createMcpWebRoutes(service, {
+      ...(typeof webServer.host === 'string' ? { bindHost: webServer.host } : {}),
+      ...(webServer.protocol === 'https:' || webServer.protocol === 'http:' ? { protocol: webServer.protocol } : {}),
+    })
     if (typeof ctx.effect === 'function') {
       ctx.effect(() => {
         const disposers = webRoutes.map((r) => webServer.register(r))
@@ -229,6 +245,7 @@ export function apply(ctx: Context, rawConfig?: Record<string, unknown>): void {
       stat: statSync,
       // A tool call starts the server it needs, so the panel's snapshot has to be refreshed then.
       onStatus: () => { void publish(agent) },
+      workspaces: workspacePaths,
     })
     sessions.set(agent, session)
     session.startIdleSweep()

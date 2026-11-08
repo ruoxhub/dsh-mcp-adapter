@@ -9,7 +9,7 @@ import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { needsApproval, requireApproval } from './approval.ts'
-import { cachedEntry, loadCache, saveCache, storeEntry, cachePath } from './cache.ts'
+import { cachedEntry, loadCache, saveCache, storeEntry, forgetEntry, cachePath } from './cache.ts'
 import type { CatalogCache } from './cache.ts'
 import { buildCatalog, searchTools } from './catalog.ts'
 import type { BuildCatalogEntry } from './catalog.ts'
@@ -64,6 +64,25 @@ export interface McpSessionOptions {
    * server as stopped until something else published a snapshot.
    */
   onStatus?: () => void
+  /**
+   * The host's registered workspace directories, read live.
+   *
+   * Optional: a composition without the registry keeps the `.git` rule. When it is present, a
+   * session sitting inside a registered workspace treats that workspace as its project, which is
+   * what the Web panel writes to — one rule, so the two halves cannot disagree about the file.
+   */
+  workspaces?: () => readonly string[]
+}
+
+/**
+ * The host's current-directory owner, as this adapter reads it.
+ *
+ * Structural on purpose: `workingDirectory` is optional in a composition (a headless mount may omit
+ * it), and only `get(session)` is needed here, so an absent service is "no answer" rather than a
+ * load-time dependency.
+ */
+interface WorkingDirectoryLike {
+  get?: (session: unknown) => string | null | undefined
 }
 
 /** An object-shaped value, arrays included. */
@@ -146,6 +165,12 @@ export class McpSession {
   blocked: BlockedServer[]
   errors: string[]
   configSignature: string
+  /**
+   * The directory the last `sync()` read config from. `header.cwd` cannot answer this: it is the
+   * directory the Session was *created* in and never changes, so a `cd` mid-session would keep
+   * reloading the old project's files forever.
+   */
+  syncedCwd: string
   projectRoot: string
   disposers: Array<() => void>
   directDisposers: Map<string, () => void>
@@ -168,21 +193,34 @@ export class McpSession {
   execContext: ToolRunLike | undefined
   /** Called after a tool call changed which servers are running; see {@link McpSessionOptions.onStatus}. */
   onStatus: (() => void) | undefined
+  /** Registered workspace directories, read live; see {@link McpSessionOptions.workspaces}. */
+  workspaces: (() => readonly string[]) | undefined
 
-  constructor({ ctx, agent, settings, logger, stat, onStatus }: McpSessionOptions) {
+  constructor({ ctx, agent, settings, logger, stat, onStatus, workspaces }: McpSessionOptions) {
     this.ctx = ctx
     this.agent = agent
     this.settings = settings
     this.logger = logger
     this.stat = stat
     this.onStatus = onStatus
+    this.workspaces = workspaces
     // `home` is the adapter state directory the pool records and never reads; the Loader entry has
     // no such field, so the source passed `undefined` here.
-    this.pool = new ServerPool({ home: settings.home ?? '', logger, onCatalog: () => this.invalidateCatalog() })
+    this.pool = new ServerPool({
+      home: settings.home ?? '',
+      // Live, not a snapshot: a lazy server may connect many steps after a `cd`.
+      cwd: () => this.cwd(),
+      logger,
+      onCatalog: () => this.invalidateCatalog(),
+      credentials: this.ctx.get?.('credentials', false),
+      userQuestions: this.ctx.get?.('userQuestions', false),
+      agent,
+    })
     this.catalog = buildCatalog(new Map<string, BuildCatalogEntry>(), settings)
     this.blocked = []
     this.errors = []
     this.configSignature = ''
+    this.syncedCwd = ''
     this.projectRoot = ''
     this.disposers = []
     this.directDisposers = new Map()
@@ -218,18 +256,57 @@ export class McpSession {
     return typeof id === 'string' ? id : undefined
   }
 
+  /**
+   * The directory this session's MCP config is discovered from: the host's *current* directory.
+   *
+   * `workingDirectory.get()` owns it (the `working_directory` tool and subagents change it mid-turn,
+   * and DSH's own tools resolve through it), so a session that `cd`s into another checkout picks up
+   * that checkout's `.mcp.json` instead of its original project's. `header.cwd` is only the fallback
+   * — it is the directory the Session was created in and never moves.
+   *
+   * There is deliberately no `process.cwd()` fallback: that is the *host process'* launch
+   * directory, which is not this session's workspace. A composition that answers with neither keeps
+   * the session on user-global config (`loadConfig` treats a missing cwd that way) rather than
+   * reading a repository nobody selected.
+   */
+  cwd(): string | undefined {
+    const service = this.ctx.get?.('workingDirectory', false) as WorkingDirectoryLike | undefined
+    let current: unknown
+    try {
+      current = service?.get?.(this.agent?.session)
+    } catch {
+      // A throwing provider is a missing answer, not a failed session.
+      current = undefined
+    }
+    if (typeof current === 'string' && current.length > 0) return current
+    const header = this.agent?.session?.header?.cwd
+    return typeof header === 'string' && header.length > 0 ? header : undefined
+  }
+
+  /** The registered workspaces this session resolves against, or none when the host has no registry. */
+  registeredWorkspaces(): readonly string[] {
+    try {
+      return this.workspaces?.() ?? []
+    } catch {
+      // A failing registry is no registry: the `.git` rule still applies.
+      return []
+    }
+  }
+
   /** Read config and prepare the pool. Does not connect anything. */
   async sync(): Promise<void> {
-    const cwd = this.agent?.session?.header?.cwd ?? process.cwd()
+    const cwd = this.cwd()
     const loaded = loadConfig({
-      cwd,
+      ...(cwd === undefined ? {} : { cwd }),
       dshHome: this.settings.dshHome,
       servers: this.settings.servers,
       configFiles: this.settings.configFiles,
+      workspaces: this.registeredWorkspaces(),
       // The Loader entry is the base layer; a project's own `settings` file overrides it inside
       // loadConfig. Every adapter policy belongs here, or it silently reverts to the default.
       settings: pickPolicySettings(this.settings),
     })
+    this.syncedCwd = cwd ?? ''
     this.projectRoot = loaded.projectRoot
     this.errors = [...loaded.errors]
     this.configSignature = signature(loaded.paths, this.stat)
@@ -298,6 +375,10 @@ export class McpSession {
   async refreshCatalog(): Promise<Catalog> {
     const missing = this.pool.names().filter((name) => this.pool.get(name)?.catalog === undefined)
     if (missing.length > 0) {
+      // Names this session actually refreshed. `persistCache` merges only these into the on-disk
+      // snapshot, so a second session's concurrent refresh is not overwritten and a server the
+      // panel purged is not resurrected from an old in-memory snapshot.
+      const stored: string[] = []
       await Promise.all(missing.map(async (name) => {
         try {
           const catalog = await this.pool.catalog(name)
@@ -306,22 +387,52 @@ export class McpSession {
           const cache = this.cache
           if (cache === undefined) throw new Error('mcp-adapter: refreshCatalog() ran before sync(), so there is no cache to write')
           storeEntry(cache, name, entry.config, catalog)
-          this.persistCache()
+          stored.push(name)
         } catch (error) {
           this.errors.push(`${name}: ${messageOf(error)}`)
         }
       }))
+      // One write for the whole cold start, not one per server: the file is a single JSON blob and
+      // writing N times serialized the same growing object N times (ADR-0010).
+      if (stored.length > 0) this.persistCache(stored)
     }
     if (this.catalogStale) await this.rebuildCatalog()
     return this.catalog
   }
 
-  persistCache(): void {
+  /** Drop a purged name from this session's own snapshot so a later write cannot revive it. */
+  forgetCachedServer(name: string): void {
+    if (this.cache !== undefined) forgetEntry(this.cache, name)
+  }
+
+  /**
+   * Write our refreshed entries into the on-disk snapshot, preserving everyone else's.
+   *
+   * `this.cache` is a snapshot taken at `sync()`. Another session (or the panel's purge) may have
+   * rewritten the file since, so writing the whole snapshot would clobber their entries and revive
+   * purged names. Since ADR-0010 shrank the file to ~1 ms per parse, re-reading and merging only
+   * the names we refreshed is cheap and keeps each session a narrow writer.
+   */
+  persistCache(names?: string[]): void {
     try {
       const home = this.cachePathResolver
       const cache = this.cache
       if (home === undefined || cache === undefined) throw new Error('the session has not synced yet, so it has no cache path')
-      saveCache(cachePath(home), cache)
+      const path = cachePath(home)
+      const disk = loadCache(path)
+      if (names === undefined) {
+        // Explicit full write (e.g. a migration): keep other sessions' entries too.
+        for (const [name, value] of Object.entries(cache.servers)) disk.servers[name] = value
+      } else {
+        for (const name of names) {
+          const value = cache.servers[name]
+          if (value !== undefined) disk.servers[name] = value
+          else delete disk.servers[name]
+        }
+      }
+      saveCache(path, disk)
+      // Keep our snapshot in step so status/reads do not drift from what is on disk.
+      cache.servers = disk.servers
     } catch (error) {
       this.logger.debug?.(`mcp-adapter: could not write the metadata cache: ${messageOf(error)}`)
     }
@@ -474,6 +585,11 @@ export class McpSession {
     return this.pool.get(server)?.config.appendStructuredContent !== false
   }
 
+  /** Whether the proxy should pay for the second catalog scan in activateMatches(). */
+  hasDirectTools(): boolean {
+    return this.directDisposers.size > 0
+  }
+
   /** Hide search-activated direct tools that no search has matched yet. */
   applyVisibility(): void {    const hidden = [...this.directDisposers.keys()].filter((name) => !this.activated.has(name))
     if (hidden.length === 0) return
@@ -499,8 +615,14 @@ export class McpSession {
 
   /** Approve a project server and pick it up without restarting the session. */
   approve(serverName: string): string {
-    const cwd = this.agent?.session?.header?.cwd ?? process.cwd()
-    const loaded = loadConfig({ cwd, dshHome: this.settings.dshHome, servers: this.settings.servers, configFiles: this.settings.configFiles })
+    const cwd = this.cwd()
+    const loaded = loadConfig({
+      ...(cwd === undefined ? {} : { cwd }),
+      dshHome: this.settings.dshHome,
+      servers: this.settings.servers,
+      configFiles: this.settings.configFiles,
+      workspaces: this.registeredWorkspaces(),
+    })
     const entry = loaded.servers.get(serverName)
     if (entry === undefined) throw new Error(`no MCP server named "${serverName}"`)
     if (entry.origin !== 'project') throw new Error(`"${serverName}" comes from ${entry.origin}, so it needs no approval`)
@@ -520,14 +642,22 @@ export class McpSession {
     this.timer.unref?.()
   }
 
-  /** True when a config file changed since the last sync. */
+  /**
+   * True when the config this session loaded no longer matches the world.
+   *
+   * A directory change counts as a change even when no file's mtime moved: the config sources
+   * themselves are resolved from that directory, so a session that `cd`s into another checkout owes
+   * a re-arm just as much as one whose `.mcp.json` was edited.
+   */
   configChanged(): boolean {
-    const cwd = this.agent?.session?.header?.cwd ?? process.cwd()
+    const cwd = this.cwd()
+    if ((cwd ?? '') !== this.syncedCwd) return true
     const loaded = loadConfig({
-      cwd,
+      ...(cwd === undefined ? {} : { cwd }),
       dshHome: this.settings.dshHome,
       servers: this.settings.servers,
       configFiles: this.settings.configFiles,
+      workspaces: this.registeredWorkspaces(),
       // The Loader entry is the base layer; a project's own `settings` file overrides it inside
       // loadConfig. Every adapter policy belongs here, or it silently reverts to the default.
       settings: pickPolicySettings(this.settings),
@@ -577,6 +707,17 @@ export class McpSession {
         // Best effort at teardown.
       }
     }
-    await this.pool.closeAll()
+    await this.pool.dispose()
+    // Drop the in-memory state that kept this session's catalogs and the parsed disk cache alive
+    // until the session object was collected (ADR-0010). The disk cache itself is untouched.
+    this.catalog = buildCatalog(new Map<string, BuildCatalogEntry>(), this.settings)
+    this.cache = undefined
+    this.cachePathResolver = undefined
+    this.blocked = []
+    this.errors = []
+    this.activated.clear()
+    this.execContext = undefined
+    this.onStatus = undefined
+    this.workspaces = undefined
   }
 }

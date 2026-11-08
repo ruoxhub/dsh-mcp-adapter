@@ -171,7 +171,11 @@ describe('saveCache', () => {
     const reloaded = loadCache(path)
     expect(Object.keys(reloaded.servers)).toEqual(['beta'])
     expect(cachedEntry(reloaded, 'alpha', serverConfig('alpha'))).toBeUndefined()
-    expect(cachedEntry(reloaded, 'beta', serverConfig('beta'))?.tools).toEqual([{ name: 'b' }])
+    // ADR-0010: storeEntry projects each tool to its persisted form, so the entry carries the
+    // defaulted description and the output-schema presence flag even for a bare fixture tool.
+    expect(cachedEntry(reloaded, 'beta', serverConfig('beta'))?.tools).toEqual([
+      { name: 'b', description: '', hasOutputSchema: false },
+    ])
   })
 })
 
@@ -189,6 +193,25 @@ describe('buildCatalog filters and prefixes', () => {
 
     // An empty include list is still truthy, so it admits nothing. The source behaves the same way.
     expect([...build([{ config: serverConfig('demo', { includeTools: [] }), tools: ['read_file'] }]).tools.keys()]).toEqual([])
+
+    // Matches prefixed tool names in includeTools/excludeTools
+    const prefixedInclude = build([{ config: serverConfig('demo', { includeTools: ['demo_read_file'] }), tools: ['read_file', 'write_file'] }])
+    expect([...prefixedInclude.tools.keys()]).toEqual(['demo_read_file'])
+
+    const prefixedExclude = build([{ config: serverConfig('demo', { excludeTools: ['demo_write_file'] }), tools: ['read_file', 'write_file'] }])
+    expect([...prefixedExclude.tools.keys()]).toEqual(['demo_read_file'])
+
+    // Supports ? single character wildcard
+    const wildcardInclude = build([{ config: serverConfig('demo', { includeTools: ['read_?ile'] }), tools: ['read_file', 'read_pile', 'read_files'] }])
+    expect([...wildcardInclude.tools.keys()]).toEqual(['demo_read_file', 'demo_read_pile'])
+
+    // Supports glob patterns in searchKeywords
+    const keywordCatalog = build([{
+      config: serverConfig('demo', { searchKeywords: { 'read_*': ['filesystem', 'disk'] } }),
+      tools: ['read_file', 'write_file'],
+    }])
+    expect(keywordCatalog.tools.get('demo_read_file')?.keywords).toEqual(['filesystem', 'disk'])
+    expect(keywordCatalog.tools.get('demo_write_file')?.keywords).toEqual([])
   })
 
   it('prefixes with the server prefix first, then the settings default', () => {
@@ -325,6 +348,60 @@ describe('describeTool', () => {
     expect(describeTool(catalog, 'demo_ping_extra')).toBe('No MCP tool named "demo_ping_extra". Did you mean: demo_ping?')
     // 'pong' is a substring of nothing, so there is no suggestion to offer.
     expect(describeTool(catalog, 'pong')).toBe('No MCP tool named "pong".')
+  })
+})
+
+// ADR-0010 regression guards. These are deterministic: no wall-clock thresholds, no CI flake.
+describe('ADR-0010 catalog slimming', () => {
+  it('never persists an outputSchema in full, even when a producer still supplies one', () => {
+    const dir = temp()
+    const path = join(dir, 'mcp-cache.json')
+    const cache = loadCache(path)
+    // A 600 KB schema is the real-world size that motivated ADR-0010 (one `rea` tool had 608 KB).
+    const huge = { type: 'object', properties: { blob: { type: 'string', description: 'x'.repeat(600_000) } } }
+    const catalog = {
+      tools: [{ name: 'inspect', description: 'd', inputSchema: { type: 'object', properties: {} }, outputSchema: huge }],
+      resources: [], prompts: [], instructions: '',
+    }
+    // The adapter's own producers no longer carry this field; a hand-edited/legacy in-memory
+    // catalog still must not be serialized back verbatim.
+    storeEntry(cache, 'demo', serverConfig('demo'), catalog as never)
+    saveCache(path, cache)
+    const raw = readFileSync(path, 'utf8')
+    expect(raw.length).toBeLessThan(2_000)
+    expect(raw).not.toContain('outputSchema')
+    expect(raw).not.toContain('xxx')
+    expect(raw).toContain('"hasOutputSchema":true')
+  })
+
+  it('precomputes lowercase search fields at build time', () => {
+    const catalog = build([{ config: serverConfig('demo'), tools: ['Ping_Tool'] }])
+    const tool = [...catalog.tools.values()][0]
+    expect(tool.hasOutputSchema).toBe(false)
+    expect(tool.search).toMatchObject({
+      name: 'demo_ping_tool',
+      originalName: 'ping_tool',
+      server: 'demo',
+      description: 'ping_tool tool',
+      normalizedName: 'demopingtool',
+      keywords: [],
+      parameters: '',
+    })
+    // Searching must not recompute or mutate the precomputed fields.
+    const before = { ...tool.search }
+    expect(searchTools(catalog, 'ping').items[0].name).toBe('demo_Ping_Tool')
+    expect(tool.search).toEqual(before)
+  })
+
+  it('derives search fields lazily for a hand-built CatalogTool', () => {
+    const catalog = build([{ config: serverConfig('demo'), tools: ['ping'] }])
+    const tool = catalog.tools.get('demo_ping')
+    if (tool === undefined) throw new Error('the fixture tool was not built')
+    tool.search = undefined
+    expect(searchTools(catalog, 'PING').items[0].name).toBe('demo_ping')
+    // Re-read from the map: the local `tool` binding is control-flow-narrowed to `search: undefined`.
+    const rebuilt = catalog.tools.get('demo_ping')?.search
+    expect(rebuilt?.name).toBe('demo_ping')
   })
 })
 

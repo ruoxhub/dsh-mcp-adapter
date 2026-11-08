@@ -11,6 +11,7 @@
 // allowlist mode (its unlisted tools ask), while `approveTools` stays a denylist. Asking on every
 // call is how you train a user to accept without reading, so nothing here asks by default.
 
+import { matchesPattern } from './catalog.ts'
 import type { AdapterSettings } from './config.ts'
 import type { CatalogTool, ServerConfig } from './types.ts'
 
@@ -70,7 +71,8 @@ export function needsApproval(config: ServerConfig | undefined, tool: CatalogToo
     const names = autoApprovedNames(autoApprove)
     // Allowlist mode: a listed tool runs, everything else on that server asks.
     if (names === null) return false
-    const listed = names.includes(tool.originalName) || names.includes(tool.name)
+    const candidates = [tool.originalName, tool.name]
+    const listed = names.some((pattern) => candidates.some((cand) => matchesPattern(cand, pattern)))
     return !listed
   }
 
@@ -81,7 +83,10 @@ export function needsApproval(config: ServerConfig | undefined, tool: CatalogToo
     // the `includes` calls below untyped. Binding to `unknown[]` first keeps them typechecked;
     // evaluation order is the source's, short-circuiting on `'*'`.
     const names: unknown[] = configured
-    return names.includes('*') || names.includes(tool.originalName) || names.includes(tool.name)
+    if (names.includes('*')) return true
+    const stringNames = names.map(String)
+    const candidates = [tool.originalName, tool.name]
+    return stringNames.some((pattern) => candidates.some((cand) => matchesPattern(cand, pattern)))
   }
   if (configured === 'destructive') return tool.annotations?.destructiveHint === true
   return false

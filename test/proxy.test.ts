@@ -108,6 +108,8 @@ function fakeSession(options: {
   maxOutputChars?: number
   spillStore?: ProxySession['spillStore']
   sessionId?: string
+  /** ADR-0010: when the host reports no direct tools, the second catalog scan is skipped. */
+  hasDirectTools?: () => boolean
 } = {}): FakeSession {
   const raw = options.raw ?? rawCatalog()
   const statuses = options.statuses ?? [{ name: 'demo', state: 'idle', hasCatalog: true, lifecycle: 'lazy' }]
@@ -155,6 +157,7 @@ function fakeSession(options: {
       session.activations.push(query)
       return []
     },
+    hasDirectTools: options.hasDirectTools,
   }
   return session
 }
@@ -239,6 +242,20 @@ describe('createProxyExecutor mode dispatch', () => {
     // Only the search branch activates: a status read must not unhide anything.
     await run({}, {})
     expect(session.activations).toEqual(['screenshot', 'ping'])
+  })
+
+  it('skips the activation rescan when the session has no direct tools (ADR-0010)', async () => {
+    const session = fakeSession({ hasDirectTools: () => false })
+    await createProxyExecutor(() => session)({ search: 'screenshot' }, {})
+    expect(session.activations).toEqual([])
+    // The search result itself is unchanged: the shortcut only removes a no-op second scan.
+    // An omitted hasDirectTools (or one returning true) keeps the activation gesture.
+    const activating = fakeSession({ hasDirectTools: () => true })
+    await createProxyExecutor(() => activating)({ search: 'screenshot' }, {})
+    expect(activating.activations).toEqual(['screenshot'])
+    const legacy = fakeSession()
+    await createProxyExecutor(() => legacy)({ search: 'screenshot' }, {})
+    expect(legacy.activations).toEqual(['screenshot'])
   })
 
   it('includes a parameter summary unless includeSchemas is exactly false', async () => {

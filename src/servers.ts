@@ -5,10 +5,15 @@
 // client is that a configured server costs nothing until it is used, and costs nothing again once
 // it goes idle. Everything here is `@modelcontextprotocol/client` + node, no host surface.
 
+import { basename, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { Client, SSEClientTransport, StreamableHTTPClientTransport, type ClientOptions, type Transport } from '@modelcontextprotocol/client'
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio'
 import type { AdapterSettings } from './config.ts'
 import { fetchWithCa, readCaBundle, type FetchLike } from './tls-fetch.ts'
+import { createRequestHeadersCommandFetch } from './request-headers-command.ts'
+import { resolveServerToken } from './credentials.ts'
+import { registerElicitationHandler, callToolPausingForElicitation, type UserQuestionsLike } from './elicitation.ts'
 import type { ServerCatalog, ServerConfig } from './types.ts'
 import { withTimeout } from './util.ts'
 
@@ -87,10 +92,23 @@ export interface PoolStatus {
 export interface ServerPoolOptions {
   /** Adapter state directory (cache and approvals live there). */
   home: string
+  /**
+   * The directory servers run in: the session's *current* directory, read at connect time.
+   *
+   * A function, not a string, because the pool outlives a step: `working_directory` can move the
+   * session between the moment the pool was built and the moment a lazy server first connects, and
+   * a snapshot would spawn that server in a directory the session has already left. This is the
+   * only place a server's directory comes from — `ServerConfig.cwd` is what a config file *wrote*,
+   * and it is resolved against this value rather than replacing it.
+   */
+  cwd?: () => string | undefined
   onCatalog?: (name: string, catalog: ServerCatalog) => void
   onStatus?: (name: string) => void
   logger?: Logger
   settings?: Partial<AdapterSettings>
+  credentials?: unknown
+  userQuestions?: UserQuestionsLike
+  agent?: unknown
 }
 
 /** An object-shaped value, which is the only shape MCP argument maps have. */
@@ -119,7 +137,22 @@ function scrubbedEnv(): Record<string, string> {
   return env
 }
 
-function stdioTransport(config: ServerConfig): StdioClientTransport {
+/**
+ * The directory one server process runs in.
+ *
+ * An entry that named a directory gets it — relative values are relative to the session's own
+ * directory, so `"./servers"` keeps meaning the same thing in every checkout. An entry that named
+ * none runs in the session's directory. `undefined` (a session that records no directory at all)
+ * is passed through: that is the one case where the child inherits the host's launch directory,
+ * because the alternative — refusing to start — would take every user-global server away from
+ * headless callers for no benefit. Config discovery and approval never make this guess.
+ */
+function resolveServerCwd(config: ServerConfig, sessionCwd: string | undefined): string | undefined {
+  if (config.cwd === undefined || config.cwd.length === 0) return sessionCwd
+  return sessionCwd === undefined ? resolve(config.cwd) : resolve(sessionCwd, config.cwd)
+}
+
+function stdioTransport(config: ServerConfig, sessionCwd: string | undefined): StdioClientTransport {
   // `normalizeEntry` guarantees a command whenever the transport is stdio (no url, no socket, or it
   // throws), so this only turns an untyped hole into a stated precondition.
   const command = config.command
@@ -127,26 +160,36 @@ function stdioTransport(config: ServerConfig): StdioClientTransport {
   return new StdioClientTransport({
     command,
     args: config.args ?? [],
-    cwd: config.cwd && config.cwd.length > 0 ? config.cwd : undefined,
+    cwd: resolveServerCwd(config, sessionCwd),
     env: config.inheritEnv === false ? { ...config.env } : { ...scrubbedEnv(), ...config.env },
     stderr: config.debug ? 'inherit' : 'pipe',
   })
 }
 
-function httpHeaders(config: ServerConfig): Record<string, string> {
+function httpHeaders(config: ServerConfig, overrideBearerToken?: string): Record<string, string> {
   const headers = { ...(config.headers ?? {}) }
-  if (config.bearerToken && headers.Authorization === undefined) headers.Authorization = `Bearer ${config.bearerToken}`
+  const token = overrideBearerToken ?? config.bearerToken
+  if (token && headers.Authorization === undefined) headers.Authorization = `Bearer ${token}`
   return headers
 }
 
-function httpTransport(config: ServerConfig, baseUrl: URL): Transport {
+function httpTransport(config: ServerConfig, baseUrl: URL, overrideBearerToken?: string): Transport {
+  let customFetch: FetchLike | undefined
+  if (config.caFile !== undefined && config.caFile.length > 0) {
+    customFetch = fetchWithCa(readCaBundle(config.caFile))
+  }
+  if (config.requestHeadersCommand !== undefined) {
+    customFetch = createRequestHeadersCommandFetch(config.requestHeadersCommand, customFetch ?? globalThis.fetch)
+  }
+
   const options: {
     requestInit: { headers: Record<string, string> }
     fetch?: FetchLike
-  } = { requestInit: { headers: httpHeaders(config) } }
-  // `caFile` trusts one extra PEM anchor for this server only. Without it the option used to be
-  // normalized and then ignored, so a private-CA server could never connect and nothing said why.
-  if (config.caFile !== undefined && config.caFile.length > 0) options.fetch = fetchWithCa(readCaBundle(config.caFile))
+  } = {
+    requestInit: { headers: httpHeaders(config, overrideBearerToken) },
+    ...(customFetch ? { fetch: customFetch } : {}),
+  }
+
   return config.httpTransport === 'sse'
     ? new SSEClientTransport(baseUrl, options)
     : new StreamableHTTPClientTransport(baseUrl, options)
@@ -159,8 +202,13 @@ function httpTransport(config: ServerConfig, baseUrl: URL): Transport {
  * the plain legacy handshake, a concrete version pins it. Anything else stays on the SDK default
  * (`'legacy'`), which is what a server that never mentioned the field should get.
  */
-function clientOptions(config: ServerConfig): ClientOptions {
-  const options: ClientOptions = { capabilities: {} }
+function clientOptions(config: ServerConfig, userQuestions?: UserQuestionsLike): ClientOptions {
+  const options: ClientOptions = {
+    capabilities: {
+      ...(config.roots !== false ? { roots: {} } : {}),
+      ...(userQuestions ? { elicitation: { form: {} } } : {}),
+    },
+  }
   const wanted = config.protocolVersion
   if (wanted === 'auto') options.versionNegotiation = { mode: 'auto' }
   else if (typeof wanted === 'string' && wanted.length > 0 && wanted !== 'legacy') {
@@ -231,15 +279,24 @@ export class ServerPool {
   onCatalog: ((name: string, catalog: ServerCatalog) => void) | undefined
   onStatus: ((name: string) => void) | undefined
   logger: Logger | undefined
+  credentials: unknown
+  userQuestions: UserQuestionsLike | undefined
+  agent: unknown
+  /** The session's live directory; see {@link ServerPoolOptions.cwd}. */
+  cwdOf: (() => string | undefined) | undefined
   /** name -> { config, connection?, connecting?, reconnectAttempts, timer, state, lastError } */
   servers: Map<string, PoolEntry>
 
-  constructor({ home, onCatalog, onStatus, logger, settings }: ServerPoolOptions) {
+  constructor({ home, cwd, onCatalog, onStatus, logger, settings, credentials, userQuestions, agent }: ServerPoolOptions) {
     this.home = home
+    this.cwdOf = cwd
     this.settings = settings ?? {}
     this.onCatalog = onCatalog
     this.onStatus = onStatus
     this.logger = logger
+    this.credentials = credentials
+    this.userQuestions = userQuestions
+    this.agent = agent
     this.servers = new Map()
   }
 
@@ -313,11 +370,33 @@ export class ServerPool {
     const config = entry.config
     entry.state = 'connecting'
     const timeoutMs = this.timeoutFor(entry)
-    const client = new Client({ name: 'dsh-mcp-adapter', version: '0.1.0' }, clientOptions(config))
+    const client = new Client({ name: 'dsh-mcp-adapter', version: '0.1.0' }, clientOptions(config, this.userQuestions))
+    if (config.roots !== false) {
+      // The root a server is told is the directory it runs in, so a tool that resolves a relative
+      // path and the process itself agree. With no known directory (a session that records none)
+      // the honest answer is an empty root list, not the host process' launch directory — that is
+      // where `dsh` happened to start, not a workspace.
+      const cwd = resolveServerCwd(config, this.cwdOf?.())
+      const roots = cwd === undefined ? [] : [{ uri: pathToFileURL(cwd).href, name: basename(cwd) || 'workspace' }]
+      try {
+        client.setRequestHandler('roots/list', () => ({ roots }))
+      } catch {
+        // Ignore registration failure on clients that do not support dynamic request handlers
+      }
+    }
+    try {
+      registerElicitationHandler(client, {
+        serverName: name,
+        userQuestions: this.userQuestions,
+        agent: this.agent,
+      })
+    } catch {
+      // Ignore registration failure on clients that do not support dynamic request handlers
+    }
     let transport: Transport | undefined
     try {
       if (config.transport === 'stdio') {
-        const stdio = stdioTransport(config)
+        const stdio = stdioTransport(config, this.cwdOf?.())
         transport = stdio
         const stderrBuffer: string[] = []
         try {
@@ -347,7 +426,11 @@ export class ServerPool {
         } catch {
           throw new Error(`server "${name}": invalid url ${JSON.stringify(config.url)}`)
         }
-        transport = httpTransport(config, url)
+        let resolvedToken = config.bearerToken
+        if (this.credentials) {
+          resolvedToken = await resolveServerToken(name, this.credentials, config.bearerToken)
+        }
+        transport = httpTransport(config, url, resolvedToken)
       }
       await withTimeout(client.connect(transport), timeoutMs, `server "${name}" did not finish the MCP handshake in ${timeoutMs} ms`)
     } catch (error) {
@@ -420,6 +503,23 @@ export class ServerPool {
     await Promise.all([...this.servers.keys()].map((name) => this.close(name)))
   }
 
+  /**
+   * Stop every connection and drop the in-memory state that would otherwise keep the session's
+   * catalogs, stderr tails and reconnect timers alive until the session object is collected.
+   * `closeAll()` alone intentionally leaves entries readable: `status()` still reports them as
+   * idle, and the idle sweep may restart a lazy server. Only a disposed session calls this.
+   */
+  async dispose(): Promise<void> {
+    await this.closeAll()
+    for (const entry of this.servers.values()) {
+      entry.catalog = undefined
+      entry.recentStderr = undefined
+      entry.connecting = undefined
+      entry.lastError = undefined
+    }
+    this.servers.clear()
+  }
+
   /** Fetch the catalog, from the connection when it is live, from the cache otherwise. */
   async catalog(name: string, { refresh = false }: { refresh?: boolean } = {}): Promise<ServerCatalog> {
     const entry = this.servers.get(name)
@@ -465,7 +565,7 @@ export class ServerPool {
         title: tool.title,
         description: tool.description ?? '',
         inputSchema: tool.inputSchema,
-        outputSchema: tool.outputSchema,
+        hasOutputSchema: tool.outputSchema !== undefined,
         annotations: tool.annotations,
       })
     }
@@ -511,7 +611,11 @@ export class ServerPool {
     // `@modelcontextprotocol/client` 2.x dropped the `resultSchema` argument the source still passed,
     // so the per-request options live in the second position; leaving them third would typecheck and
     // silently discard both the timeout and the cancellation signal.
-    const result = await connection.client.callTool({ name: toolName, arguments: toolArguments(args) }, { timeout: timeoutMs, signal })
+    const result = await callToolPausingForElicitation(
+      connection.client,
+      { name: toolName, arguments: toolArguments(args) },
+      { timeout: timeoutMs, signal },
+    )
     connection.lastUsedAt = Date.now()
     return result
   }
@@ -527,6 +631,9 @@ export class ServerPool {
    * Bounded on purpose: only tools that actually declare an `outputSchema` pay for the extra
    * listing, and only once per connection. A failed listing is not fatal — the call may still
    * succeed, and failing it here would turn an unreadable catalog into a broken server.
+   *
+   * Our catalog keeps only a presence flag (`hasOutputSchema`), never the schema itself: the SDK
+   * validates from its own `tools/list` cache, so the full schema would just inflate the disk cache.
    */
   private async ensureOutputSchemaValidation(
     name: string,
@@ -538,7 +645,7 @@ export class ServerPool {
   ): Promise<void> {
     if (connection.toolsListed) return
     const declared = entry.catalog?.tools.find((tool) => tool.name === toolName)
-    if (declared?.outputSchema === undefined) return
+    if (declared?.hasOutputSchema !== true) return
     try {
       await connection.client.listTools(undefined, { timeout: timeoutMs, signal })
     } catch (error) {

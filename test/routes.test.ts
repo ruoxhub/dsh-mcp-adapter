@@ -9,6 +9,7 @@ function createMockReq(options: {
   url?: string
   body?: unknown
   rawBody?: string
+  headers?: Record<string, string>
 }): any {
   const bodyText = options.rawBody !== undefined
     ? options.rawBody
@@ -16,7 +17,10 @@ function createMockReq(options: {
   const req = Readable.from(bodyText ? [Buffer.from(bodyText)] : []) as any
   req.method = options.method ?? 'GET'
   req.url = options.url ?? '/'
-  req.headers = { 'content-type': 'application/json' }
+  // Every real request from the GUI carries these: `Host` is what the fence binds to, and the
+  // browser's own same-origin header set is the case the routes must accept. Tests that need the
+  // refusal paths override them.
+  req.headers = { 'content-type': 'application/json', host: '127.0.0.1:3080', ...options.headers }
   return req
 }
 
@@ -298,16 +302,24 @@ describe('Mcp Routes & WebServer Registration', () => {
         expect(getBody()).toEqual({ ok: true })
       })
 
-      it('allows optional cwd (falling back to process.cwd()) and validates required name', async () => {
-        const service = { approveServer: vi.fn().mockResolvedValue({ ok: true }) } as unknown as McpServersService
+      it('forwards a missing cwd as undefined instead of guessing the host process directory', async () => {
+        const service = {
+          // The real service refuses a workspace write with no directory; this test pins the route's
+          // half: it must forward `undefined` rather than inventing `process.cwd()`.
+          approveServer: vi.fn().mockImplementation(({ cwd }: { cwd?: string }) => {
+            if (cwd === undefined) throw Object.assign(new Error('Workspace scope needs the session workspace directory; the request named none'), { statusCode: 400 })
+            return Promise.resolve({ ok: true })
+          }),
+        } as unknown as McpServersService
         const route = findRoute(createMcpWebRoutes(service), '/api/dsh-mcp-adapter/approve')
 
-        // Missing cwd: succeeds with process.cwd() fallback
+        // Missing cwd: the route forwards it, the service refuses with 400 rather than writing to
+        // whatever directory the harness process was launched from.
         let req = createMockReq({ method: 'POST', url: '/api/dsh-mcp-adapter/approve', body: { name: 's1' } })
         let mock = createMockRes()
         await route.handler(req, mock.res)
-        expect(mock.getStatusCode()).toBe(200)
-        expect(service.approveServer).toHaveBeenCalledWith({ cwd: process.cwd(), name: 's1' })
+        expect(service.approveServer).toHaveBeenCalledWith({ cwd: undefined, name: 's1' })
+        expect(mock.getStatusCode()).toBe(400)
 
         // Missing name: 400
         req = createMockReq({ method: 'POST', url: '/api/dsh-mcp-adapter/approve', body: { cwd: '/ws' } })

@@ -67,7 +67,7 @@ function catalogTool(overrides: Partial<CatalogTool> = {}): CatalogTool {
     originalName: 'ping',
     description: '',
     inputSchema: undefined,
-    outputSchema: undefined,
+    hasOutputSchema: false,
     keywords: [],
     ...overrides,
   }

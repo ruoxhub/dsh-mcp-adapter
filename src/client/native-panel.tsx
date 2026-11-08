@@ -82,18 +82,31 @@ export function McpServersPanelPage({
   )
 }
 
-/** The slice of the Client Session list this panel reads: identity plus each row's directory. */
+/** The slice of the Client Session list this panel reads: identity, creation cwd, and projections. */
 interface SessionListShape {
   ids?: readonly string[]
-  byId?: Record<string, { cwd?: string; retainedBy?: Readonly<Partial<Record<string, number>>> } | undefined>
+  byId?: Record<string, {
+    cwd?: string
+    retainedBy?: Readonly<Partial<Record<string, number>>>
+    /** Host-computed projection values; `workingDirectory` is present when the host mounts it. */
+    projectionValues?: { workingDirectory?: unknown }
+  } | undefined>
 }
 
-/** The directory of the Session the main view currently shows; `''` when none is selected. */
+/**
+ * The directory of the Session the main view currently shows; `''` when none is selected.
+ *
+ * `projectionValues.workingDirectory` is the Session's *current* directory — the `working_directory`
+ * tool moves it and DSH's own file tools follow it — while `cwd` is only the directory the Session
+ * was created in. Reading `cwd` here would make the panel manage the original project after a `cd`.
+ */
 function mainSessionCwd(state: SessionListShape): string {
   for (const id of state.ids ?? []) {
     const row = state.byId?.[id]
     if (row === undefined) continue
     if ((row.retainedBy?.mainView ?? 0) <= 0) continue
+    const current = row.projectionValues?.workingDirectory
+    if (typeof current === 'string' && current !== '') return current
     if (typeof row.cwd === 'string' && row.cwd !== '') return row.cwd
   }
   return ''

@@ -6,9 +6,15 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { definitionHash } from './trust.ts'
-import type { ServerCatalog, ServerConfig } from './types.ts'
+import type { ServerCatalog, ServerConfig, ServerTool } from './types.ts'
 
-export const CACHE_VERSION = 1
+/**
+ * ADR-0010: v2 stops persisting each tool's `outputSchema` in full. The SDK validates results
+ * from its own `tools/list` cache, so the adapter only needs to know whether a schema was
+ * declared. On real data that is ~3.6 MB of a 4 MB cache file that was parsed on every `sync()`
+ * and never read. A v1 file fails the envelope check and cold-starts once.
+ */
+export const CACHE_VERSION = 2
 
 /**
  * One server's persisted catalog: the server's own payload from `ServerCatalog`, plus the hash of
@@ -87,11 +93,31 @@ export function cachedEntry(cache: CatalogCache, name: string, config: ServerCon
   return entry
 }
 
+/**
+ * The persisted form of one tool: the fields `buildCatalog` and `searchTools` actually read, plus
+ * the ADR-0010 presence flag. Projecting at the write boundary (rather than relying on every
+ * producer) is what guarantees a full `outputSchema` never reaches `mcp-cache.json` — the file is
+ * editable by hand, so a stray schema in a catalog would otherwise be serialized back verbatim.
+ */
+function storedTool(tool: ServerTool): ServerTool {
+  // A hand-edited/older catalog may still carry the full schema under the removed field name.
+  // Read it only to derive the flag; never copy it into the persisted entry.
+  const legacy = (tool as ServerTool & { outputSchema?: unknown }).outputSchema
+  return {
+    name: tool.name,
+    ...(tool.title === undefined ? {} : { title: tool.title }),
+    description: tool.description ?? '',
+    ...(tool.inputSchema === undefined ? {} : { inputSchema: tool.inputSchema }),
+    hasOutputSchema: tool.hasOutputSchema === true || legacy !== undefined,
+    ...(tool.annotations === undefined ? {} : { annotations: tool.annotations }),
+  }
+}
+
 /** Replace one server's catalog. A server that reports nothing keeps an explicit empty catalog. */
 export function storeEntry(cache: CatalogCache, name: string, config: ServerConfig, catalog: ServerCatalog): CachedCatalog {
   cache.servers[name] = {
     configHash: configHash(config),
-    tools: catalog.tools ?? [],
+    tools: (catalog.tools ?? []).map(storedTool),
     resources: catalog.resources ?? [],
     prompts: catalog.prompts ?? [],
     instructions: catalog.instructions ?? '',

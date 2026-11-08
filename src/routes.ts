@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { isTrustedPanelRequest, type ListenerFacts } from './request-trust.ts'
 import type { McpServersService } from './service.ts'
 import type { ExternalMcpCandidate, Scope } from './types.ts'
 
@@ -79,8 +80,18 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-export function createMcpWebRoutes(service: McpServersService): McpWebRoute[] {
-  return [
+/**
+ * The panel's REST surface.
+ *
+ * Every route is wrapped in the browser-trust fence before it runs: these routes write config files
+ * and start processes, and DSH's own /api fence sits on the RPC bridge rather than on the web
+ * server, so a route registered here would otherwise answer any page that can reach the port.
+ * @param service - the backend these routes call.
+ * @param listener - the listener facts `ctx.webServer` exposes; the fence needs them.
+ * @returns one exact-path route per panel operation.
+ */
+export function createMcpWebRoutes(service: McpServersService, listener: ListenerFacts = {}): McpWebRoute[] {
+  const routes: McpWebRoute[] = [
     {
       kind: 'exact',
       path: `/${ROUTES.servers}`,
@@ -170,7 +181,9 @@ export function createMcpWebRoutes(service: McpServersService): McpWebRoute[] {
             writeJson(res, 400, { error: 'Field "name" is required' })
             return
           }
-          const effectiveCwd = typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : process.cwd()
+          // No `process.cwd()` fallback: the service refuses a workspace write that names no
+          // workspace, because the host's launch directory is not one this panel may modify.
+          const effectiveCwd = typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined
           await service.approveServer({ cwd: effectiveCwd, name: name.trim() })
           writeJson(res, 200, { ok: true })
         } catch (err: unknown) {
@@ -427,6 +440,16 @@ export function createMcpWebRoutes(service: McpServersService): McpWebRoute[] {
       },
     },
   ]
+  return routes.map((route) => ({
+    ...route,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      if (!isTrustedPanelRequest(req, listener)) {
+        writeJson(res, 403, { error: 'Refused: this request did not come from this Harness GUI' })
+        return
+      }
+      return route.handler(req, res)
+    },
+  }))
 }
 
 export function createMcpRouter(router: RouterLike, service: McpServersService): void {
@@ -507,7 +530,7 @@ export function createMcpRouter(router: RouterLike, service: McpServersService):
         ctx.body = { error: 'Field "name" is required' }
         return
       }
-      const effectiveCwd = typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : process.cwd()
+      const effectiveCwd = typeof cwd === 'string' && cwd.trim().length > 0 ? cwd.trim() : undefined
       await service.approveServer({ cwd: effectiveCwd, name: name.trim() })
       ctx.status = 200
       ctx.body = { ok: true }

@@ -12,9 +12,9 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { importHostServers } from './imports.ts'
-import type { ServerConfig } from './types.ts'
+import type { HttpRequestHeadersCommand, ServerConfig } from './types.ts'
 
 /** Server names become tool-name segments, so they follow the same character set dsh enforces. */
 export const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
@@ -111,6 +111,13 @@ export interface LoadConfigOptions {
   settings?: Partial<AdapterSettings>
   /** Home directory searched for other agents' config files. */
   homeDir?: string
+  /**
+   * Registered workspace directories, deepest match first. A session's current directory that sits
+   * inside one of these makes that directory the project — not its `.git` ancestor — because the
+   * registry is what DSH treated as the workspace, and a subdirectory of a repository can be its own
+   * workspace there. Omitted entirely when the host has no registry.
+   */
+  workspaces?: readonly string[]
 }
 
 export interface LoadedConfig {
@@ -170,6 +177,30 @@ export function findProjectRoot(cwd: string): string {
   }
 }
 
+/**
+ * The project root for one directory, honouring the host's workspace registry.
+ *
+ * `findProjectRoot` walks up to the nearest `.git`, which is the right rule when nothing else knows
+ * better. A registered workspace is better knowledge: DSH lets a repository subdirectory be its own
+ * workspace, so a session running there must read that directory's `.mcp.json`, and the panel writes
+ * the same file. The deepest containing registered path wins, so nested workspaces do not shadow each
+ * other; anything outside every workspace keeps the `.git` rule.
+ * @param cwd - an absolute session directory.
+ * @param registered - registered workspace paths, if the composition has a registry.
+ * @returns the project root.
+ */
+export function resolveProjectRoot(cwd: string, registered: readonly string[] = []): string {
+  const effective = resolve(cwd)
+  const match = registered
+    .map((path) => resolve(path))
+    .filter((path) => {
+      const rel = relative(path, effective)
+      return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+    })
+    .sort((left, right) => right.length - left.length)[0]
+  return match ?? findProjectRoot(effective)
+}
+
 /** `$DSH_HOME` when set, else `~/.dsh` — the same rule the rest of the harness applies. */
 export function resolveDshHome(environment: NodeJS.ProcessEnv = process.env): string {
   const override = environment.DSH_HOME
@@ -220,6 +251,31 @@ function requestTimeoutOf(raw: Record<string, unknown>): number | undefined {
   return undefined
 }
 
+function requestHeadersCommandOf(raw: Record<string, unknown>, env: NodeJS.ProcessEnv): HttpRequestHeadersCommand | undefined {
+  const val = raw.requestHeadersCommand
+  if (!val) return undefined
+  if (typeof val === 'string' && val.trim().length > 0) {
+    return { command: String(expandEnv(val, env)), timeoutMs: 10_000 }
+  }
+  if (typeof val === 'object' && val !== null && !Array.isArray(val)) {
+    const cmdVal = (val as Record<string, unknown>).command
+    if (typeof cmdVal !== 'string' || cmdVal.trim().length === 0) return undefined
+    const argsVal = (val as Record<string, unknown>).args
+    const args = Array.isArray(argsVal) ? argsVal.map((a) => String(expandEnv(String(a), env))) : undefined
+    const envVal = (val as Record<string, unknown>).env
+    const commandEnv = typeof envVal === 'object' && envVal !== null ? stringRecord(envVal, env) : undefined
+    const timeoutVal = (val as Record<string, unknown>).timeoutMs
+    const timeoutMs = typeof timeoutVal === 'number' && Number.isFinite(timeoutVal) && timeoutVal > 0 ? timeoutVal : 10_000
+    return {
+      command: String(expandEnv(cmdVal, env)),
+      ...(args ? { args } : {}),
+      ...(commandEnv ? { env: commandEnv } : {}),
+      timeoutMs,
+    }
+  }
+  return undefined
+}
+
 /** `['lazy', 'keep-alive', 'lazy-keep-alive', 'eager'].includes(value)`, without trusting the input. */
 function lifecycleOf(value: unknown): ServerConfig['lifecycle'] {
   switch (value) {
@@ -236,12 +292,13 @@ function lifecycleOf(value: unknown): ServerConfig['lifecycle'] {
 /**
  * One server definition. Field names follow pi-mcp-adapter so an existing `.mcp.json` works:
  * `command`/`args`/`env` for stdio, `url`/`headers` for HTTP, plus lifecycle, filters, approval.
+ *
+ * No directory is passed in: a definition describes *what runs*, and the directory it runs in
+ * belongs to the session that connects it. Filling `cwd` in from the project here would put the
+ * folder into `definitionHash`, which is how one user-global server came to have a different
+ * approval record and cached catalog in every workspace.
  */
-export function normalizeEntry(
-  name: string,
-  raw: unknown,
-  { env = process.env, projectRoot }: { env?: NodeJS.ProcessEnv; projectRoot?: string } = {},
-): ServerEntry {
+export function normalizeEntry(name: string, raw: unknown, { env = process.env }: { env?: NodeJS.ProcessEnv } = {}): ServerEntry {
   if (!isRecord(raw)) throw new Error(`server "${name}": entry must be an object`)
   if (raw.disabled === true || raw.enabled === false) return { name, disabled: true }
 
@@ -259,6 +316,7 @@ export function normalizeEntry(
   const auth = raw.auth === 'oauth' || raw.auth === 'bearer' || raw.auth === false ? raw.auth : undefined
   const httpTransport = httpTransportOf(raw)
   const requestTimeoutMs = requestTimeoutOf(raw)
+  const requestHeadersCommand = requestHeadersCommandOf(raw, env)
 
   return {
     name,
@@ -267,8 +325,10 @@ export function normalizeEntry(
     args,
     env: stringRecord(raw.env, env),
     inheritEnv: raw.inheritEnv !== false,
-    // Project servers run from the repository they were declared in, so relative arguments work.
-    cwd: typeof raw.cwd === 'string' && isAbsolute(raw.cwd) ? raw.cwd : projectRoot ?? '',
+    // Only what the file actually wrote: absent means "the session's directory", resolved at
+    // connect time. A relative value is kept relative for the same reason, so `"./servers"` means
+    // the same thing in every checkout while the definition stays identical across them.
+    ...(typeof raw.cwd === 'string' && raw.cwd.length > 0 ? { cwd: raw.cwd } : {}),
     // The source keeps every url that is not `undefined` verbatim: `url === undefined ? {} : { url }`.
     // A non-string one still reaches `new URL`, whose ToString coercion is what `String` applies here,
     // so an array-shaped url keeps connecting instead of being dropped with `transport` still `http`.
@@ -280,6 +340,7 @@ export function normalizeEntry(
     ...(oauth === undefined ? {} : { oauth }),
     ...(typeof raw.bearerToken === 'string' ? { bearerToken: String(expandEnv(raw.bearerToken, env)) } : {}),
     ...(typeof raw.bearerTokenEnv === 'string' ? { bearerToken: env[raw.bearerTokenEnv] } : {}),
+    ...(requestHeadersCommand ? { requestHeadersCommand } : {}),
     lifecycle: lifecycleOf(raw.lifecycle),
     ...(typeof raw.idleTimeout === 'number' && Number.isFinite(raw.idleTimeout) && raw.idleTimeout >= 0 ? { idleTimeout: raw.idleTimeout } : {}),
     ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
@@ -293,6 +354,7 @@ export function normalizeEntry(
     ...(raw.autoApprove === undefined || raw.autoApprove === false ? {} : { autoApprove: raw.autoApprove }),
     exposeResources: raw.exposeResources !== false,
     appendStructuredContent: raw.appendStructuredContent !== false,
+    roots: raw.roots !== false,
     ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
     ...(typeof raw.toolPrefix === 'string' ? { toolPrefix: raw.toolPrefix } : {}),
     ...(httpTransport === undefined ? {} : { httpTransport }),
@@ -323,19 +385,28 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadedConfig {
   const environment = options.env ?? process.env
   const dshHome = options.dshHome ?? resolveDshHome(environment)
   const home = adapterHome(dshHome)
-  const cwd = resolve(options.cwd ?? process.cwd())
-  const projectRoot = findProjectRoot(cwd)
+  // No directory means no project: the caller (a session that knows neither its working directory
+  // nor its creation cwd) gets the user-global sources only. Falling back to `process.cwd()` here
+  // read *the harness process'* launch directory as if it were the session's workspace — `/home`
+  // for a service started from a shell, a folder nobody selected in the UI.
+  const cwd = options.cwd === undefined ? undefined : resolve(options.cwd)
+  const projectRoot = cwd === undefined ? '' : resolveProjectRoot(cwd, options.workspaces)
 
   const sources: ConfigSource[] = [
     { path: join(home, 'mcp.json'), scope: 'global' },
     { path: join(home, 'mcp-adapter.json'), scope: 'global' },
-    ...PROJECT_FILES.map((relative): ConfigSource => ({ path: join(projectRoot, relative), scope: 'project' })),
   ]
+  if (projectRoot !== '') {
+    for (const relative of PROJECT_FILES) sources.push({ path: join(projectRoot, relative), scope: 'project' })
+  }
   for (const entry of Array.isArray(options.configFiles) ? options.configFiles : []) {
     const spec: unknown = typeof entry === 'string' ? { path: entry } : entry
     if (spec === null || typeof spec !== 'object' || !('path' in spec) || typeof spec.path !== 'string') continue
+    // A relative extra file needs a directory to be relative to; without one it is skipped rather
+    // than resolved against the host's launch directory. An absolute one still works.
+    if (!isAbsolute(spec.path) && cwd === undefined) continue
     sources.push({
-      path: isAbsolute(spec.path) ? spec.path : resolve(cwd, spec.path),
+      path: isAbsolute(spec.path) ? spec.path : resolve(cwd as string, spec.path),
       scope: 'scope' in spec && spec.scope === 'project' ? 'project' : 'custom',
     })
   }
@@ -375,7 +446,7 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadedConfig {
         continue
       }
       try {
-        const config = normalizeEntry(name, raw, { env: environment, projectRoot })
+        const config = normalizeEntry(name, raw, { env: environment })
         if (refuseUnsupportedTransport(name, source.path, config, errors)) continue
         servers.set(name, { origin: source.scope, path: source.path, config })
       } catch (error) {
@@ -395,7 +466,7 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadedConfig {
       continue
     }
     try {
-      const config = normalizeEntry(name, entry.raw, { env: environment, projectRoot })
+      const config = normalizeEntry(name, entry.raw, { env: environment })
       if (refuseUnsupportedTransport(name, entry.path, config, errors)) continue
       servers.set(name, { origin: 'imported', path: entry.path, config })
     } catch (error) {
@@ -410,7 +481,7 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadedConfig {
       continue
     }
     try {
-      const config = normalizeEntry(name, raw, { env: environment, projectRoot })
+      const config = normalizeEntry(name, raw, { env: environment })
       if (refuseUnsupportedTransport(name, 'config.servers', config, errors)) continue
       servers.set(name, { origin: 'config', path: '', config })
     } catch (error) {

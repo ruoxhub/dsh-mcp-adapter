@@ -47,7 +47,7 @@ describe('MCP Service - Toggle and Catalog', () => {
       enabled: false,
     })
     expect(res1).toEqual({ ok: true, enabled: false })
-    expect(onEvict).toHaveBeenCalledWith('tavily')
+    expect(onEvict).toHaveBeenCalledWith('tavily', undefined)
 
     const file1 = JSON.parse(await fs.readFile(userMcp, 'utf8'))
     expect(file1.mcpServers.tavily.disabled).toBe(true)
@@ -217,7 +217,7 @@ describe('External MCP Tool Scanner & Importer', () => {
     })
 
     expect(res).toEqual({ ok: true })
-    expect(onEvict).toHaveBeenCalledWith('portable_server')
+    expect(onEvict).toHaveBeenCalledWith('portable_server', projectDir)
 
     // Removed from user
     const userJson = JSON.parse(await fs.readFile(userMcp, 'utf8'))

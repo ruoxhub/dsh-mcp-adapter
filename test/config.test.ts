@@ -18,8 +18,10 @@ describe('config', () => {
   })
 
   it('normalizes a stdio entry and defaults its lifecycle to lazy', () => {
-    const entry = normalizeEntry('demo', { command: 'npx', args: ['-y', 'x'] }, { projectRoot: '/repo' })
-    expect(entry).toMatchObject({ name: 'demo', transport: 'stdio', lifecycle: 'lazy', cwd: '/repo', args: ['-y', 'x'] })
+    const entry = normalizeEntry('demo', { command: 'npx', args: ['-y', 'x'] })
+    // No directory in the definition: it describes what runs, and the session supplies where.
+    expect(entry).toMatchObject({ name: 'demo', transport: 'stdio', lifecycle: 'lazy', args: ['-y', 'x'] })
+    expect((entry as ServerConfig).cwd).toBeUndefined()
   })
 
   it('rejects an entry with neither command, url nor socket', () => {
@@ -77,7 +79,8 @@ describe('config', () => {
       expect(loaded.paths).toHaveLength(4)
       expect(loaded.loaded).toHaveLength(2)
       expect(loaded.servers.get('demo')).toMatchObject({ origin: 'project', config: { command: 'project-one' } })
-      expect(loaded.servers.get('demo')?.config).toMatchObject({ cwd: join(root, 'repo') })
+      // A project file's entry carries no directory of its own — the session supplies it at spawn.
+      expect((loaded.servers.get('demo')?.config as ServerConfig).cwd).toBeUndefined()
       const off = loaded.servers.get('off')
       expect(off?.config && isDisabledEntry(off.config)).toBe(true)
     } finally {

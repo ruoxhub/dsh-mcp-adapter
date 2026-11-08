@@ -182,8 +182,8 @@ function firstText(result: unknown): string {
 }
 
 /** A normalized stdio config for a fixture server, narrowed out of the disabled union. */
-function serverEntry(name: string, raw: unknown, projectRoot: string): ServerConfig {
-  const entry = normalizeEntry(name, raw, { projectRoot })
+function serverEntry(name: string, raw: unknown): ServerConfig {
+  const entry = normalizeEntry(name, raw)
   if (isDisabledEntry(entry)) throw new Error(`test config for "${name}" was unexpectedly disabled`)
   return entry
 }
@@ -325,7 +325,7 @@ it('the cached catalog survives a restart and skips the first connection', async
   expect(entry.tools[0].description).toBe('from cache')
 
   // An edited definition invalidates the cache entry rather than serving a stale catalog.
-  const edited = serverEntry('demo', { command: 'other-command' }, '')
+  const edited = serverEntry('demo', { command: 'other-command' })
   expect(cachedEntry(reloaded, 'demo', edited)).toBe(undefined)
 })
 
@@ -360,9 +360,9 @@ it('idle servers are stopped and keep-alive servers are left alone', async () =>
 it('trust records pin the exact definition', () => {
   const fixes = fixture()
   const file = approvalsPath(fixes.home)
-  const original = serverEntry('demo', { command: 'npx', args: ['-y', 'demo'] }, '')
+  const original = serverEntry('demo', { command: 'npx', args: ['-y', 'demo'] })
   approve(file, fixes.project, 'demo', original)
-  expect(definitionHash(original)).not.toBe(definitionHash(serverEntry('demo', { command: 'npx', args: ['-y', 'evil'] }, '')))
+  expect(definitionHash(original)).not.toBe(definitionHash(serverEntry('demo', { command: 'npx', args: ['-y', 'evil'] })))
 })
 
 it('a warm cache answers search with the server stopped, and a call starts it', async () => {
@@ -474,7 +474,7 @@ it('the child process never receives ambient credentials or DSH_ variables', asy
     delete process.env[benignKey]
   })
 
-  const config = serverEntry('demo', { command: process.execPath, args: [fixes.server, dump] }, fixes.project)
+  const config = serverEntry('demo', { command: process.execPath, args: [fixes.server, dump] })
   const pool = makePool(fixes.home)
   await pool.configure([{ config }])
   await pool.catalog('demo')
@@ -497,7 +497,7 @@ it('an aborted signal cancels a tools/call before the request reaches the server
   // observable: a call that was really cancelled never appears in that log.
   const fixes = fixture(TEST_SERVER_SOURCE)
   writeServerConfig(fixes.project, fixes.server)
-  const config = serverEntry('demo', { command: process.execPath, args: [fixes.server] }, fixes.project)
+  const config = serverEntry('demo', { command: process.execPath, args: [fixes.server] })
   const pool = makePool(fixes.home)
   await pool.configure([{ config }])
   // Warm the connection first, so the rejection below is the request's cancellation rather than a
@@ -642,7 +642,9 @@ it('a warm-cache call still gets the SDK output-schema check the first call used
       name: 'broken',
       description: 'Declares an output schema, then violates it.',
       inputSchema: { type: 'object', properties: {} },
-      outputSchema: { type: 'object', properties: { total: { type: 'number' } }, required: ['total'] },
+      // ADR-0010: the catalog keeps only a presence flag; the SDK still lists tools on the fresh
+      // connection and validates structuredContent against its own copy of the schema.
+      hasOutputSchema: true,
     }],
     resources: [],
     prompts: [],
@@ -772,4 +774,207 @@ it('protocolVersion: "auto" reaches the SDK and probes with server/discover', as
 
   const events = readFileSync(fixes.events, 'utf8')
   expect(events).toMatch(/method (server\/discover|initialize)/)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Which directory is "the session's workspace"
+//
+// `header.cwd` is the directory a Session was *created* in and never changes; `workingDirectory`
+// owns the current one, and the `working_directory` tool / subagents move it. A session that `cd`s
+// into another checkout must load that checkout's `.mcp.json`, so these three cases pin the
+// adapter to the host's live answer and refuse to guess when there is none.
+// ---------------------------------------------------------------------------------------------
+
+/** A working-directory provider stub: the same shape the host service exposes. */
+function workingDirectoryAt(path: string | undefined): { get: () => string | undefined } {
+  return { get: () => path }
+}
+
+it('picks up the .mcp.json of the directory the session cd-ed into', async () => {
+  const fixes = fixture()
+  writeServerConfig(fixes.project, fixes.server)
+  // A second checkout with its own server, reachable only from the live directory.
+  const other = join(fixes.root, 'other-project')
+  mkdirSync(join(other, '.git'), { recursive: true })
+  writeFileSync(join(other, '.mcp.json'), JSON.stringify({
+    mcpServers: { elsewhere: { command: process.execPath, args: ['-e', ''] } },
+  }), 'utf8')
+
+  const { tools, agent } = makeAgent(fixes.project)
+  let live: string | undefined = other
+  const scoped = agent.ctx as Record<string, unknown>
+  const session = new McpSession({
+    // `workingDirectory` is optional in a composition, so it is reached through `ctx.get`.
+    ctx: { ...scoped, get: (name: string) => (name === 'workingDirectory' ? workingDirectoryAt(live) : undefined) } as never,
+    agent: agent as never,
+    settings: { ...DEFAULT_SETTINGS, dshHome: fixes.home, servers: {}, configFiles: [], projectServers: 'allow' },
+    logger: { debug() {}, warn() {} },
+    stat: statSync,
+  })
+  cleanups.push(() => session.dispose())
+
+  await session.sync()
+  expect(session.projectRoot).toBe(other)
+  expect(session.pool.names()).toEqual(['elsewhere'])
+  expect(tools.size).toBe(0)
+
+  // Moving back to the original project makes the loaded config stale, even though no file moved
+  // its mtime: the *sources themselves* are resolved from the directory.
+  live = fixes.project
+  expect(session.configChanged()).toBe(true)
+  await session.sync()
+  expect(session.projectRoot).toBe(fixes.project)
+  expect(session.pool.names()).toEqual(['demo'])
+})
+
+it('reads user-global config instead of process.cwd() when the session names no directory', async () => {
+  const fixes = fixture()
+  writeServerConfig(fixes.project, fixes.server)
+  // A user-global server proves the global layer still loads with no project at all.
+  writeFileSync(join(fixes.state, 'mcp.json'), JSON.stringify({
+    mcpServers: { global: { command: process.execPath, args: ['-e', ''] } },
+  }), 'utf8')
+
+  const { agent } = makeAgent(fixes.project)
+  const scoped = agent.ctx as Record<string, unknown>
+  const session = new McpSession({
+    // Neither a working directory nor a creation cwd: the host process' own directory is NOT this
+    // session's workspace, so guessing it would read a repository nobody selected.
+    ctx: { ...scoped, get: () => undefined } as never,
+    agent: { id: 'agent-1', session: { header: {} }, ctx: {} } as never,
+    settings: { ...DEFAULT_SETTINGS, dshHome: fixes.home, servers: {}, configFiles: [], projectServers: 'allow' },
+    logger: { debug() {}, warn() {} },
+    stat: statSync,
+  })
+  cleanups.push(() => session.dispose())
+
+  await session.sync()
+  expect(session.projectRoot).toBe('')
+  expect(session.pool.names()).toEqual(['global'])
+  // `configChanged()` compares against the recorded directory, so an answer that appears later is
+  // itself a change.
+  expect(session.configChanged()).toBe(false)
+})
+
+// The regression this pins: a server's directory is part of *where it runs*, not of *what runs*, so
+// moving the session must move the child without changing the definition's identity. Before the
+// split, `cwd` was filled in from the project root at normalization time, which put the directory
+// into `definitionHash` — every workspace then had its own cache entry and approval for the same
+// user-global server, and each write evicted the other workspace's.
+it('reuses one definition identity across two session directories while the child follows the session', async () => {
+  // A distinct binding: the shared server source below imports `appendFileSync` itself, and a
+  // second declaration of the same identifier is a syntax error rather than a duplicate import.
+  const fixes = fixture(`
+import { appendFileSync as appendCwdReport } from 'node:fs';
+appendCwdReport(process.argv[2], JSON.stringify({ pid: process.pid, cwd: process.cwd() }) + '\\n');
+` + SERVER_SOURCE)
+  const report = join(fixes.root, 'cwd.log')
+  const other = join(fixes.root, 'other-workspace')
+  mkdirSync(other, { recursive: true })
+
+  // A session directory that the test moves, exactly like `cd` moves one.
+  let sessionCwd: string | undefined = fixes.project
+  const config = serverEntry('demo', { command: process.execPath, args: [fixes.server, report] })
+  // The definition carries no directory of its own, so its identity cannot depend on one.
+  expect(config.cwd).toBeUndefined()
+
+  const pool = new ServerPool({ home: fixes.home, cwd: () => sessionCwd, logger: { debug() {} } })
+  cleanups.push(() => pool.closeAll())
+  await pool.configure([{ config }])
+
+  const catalog = await pool.catalog('demo')
+  const firstHash = definitionHash(config)
+  // What the cache would persist for this connection: the catalog is keyed by it, so a stable hash
+  // is what makes the second workspace hit the first one's entry instead of re-listing the server.
+  const cache = loadCache(join(fixes.state, 'mcp-cache.json'))
+  storeEntry(cache, 'demo', config, catalog)
+  saveCache(join(fixes.state, 'mcp-cache.json'), cache)
+  await pool.closeAll()
+
+  // `cd` into the other workspace; the definition object is the same one, untouched.
+  sessionCwd = other
+  // `refresh` because the catalog is already known: this must reconnect, not replay cache, so the
+  // second spawn's directory is what the assertion below reads.
+  const secondCatalog = await pool.catalog('demo', { refresh: true })
+  expect(secondCatalog.tools.map((tool) => tool.name)).toEqual(catalog.tools.map((tool) => tool.name))
+
+  // The persisted entry still matches: one identity, not one per workspace.
+  expect(cachedEntry(loadCache(join(fixes.state, 'mcp-cache.json')), 'demo', config)).toBeDefined()
+  expect(definitionHash(config)).toBe(firstHash)
+
+  const reports = readFileSync(report, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { pid: number; cwd: string })
+  expect(reports).toHaveLength(2)
+  // Same definition, two different processes — each in the directory the session was in at connect.
+  expect(reports[0].cwd).toBe(fixes.project)
+  expect(reports[1].cwd).toBe(other)
+  expect(reports[0].pid).not.toBe(reports[1].pid)
+})
+
+it('a cold start writes the cache once, not once per server, and merges other sessions (ADR-0010)', async () => {
+  const fixes = fixture()
+  // Two cold servers in one session: the old loop called persistCache() inside Promise.all, so a
+  // single cold start serialized the whole growing file twice.
+  writeFileSync(join(fixes.project, '.mcp.json'), JSON.stringify({
+    mcpServers: {
+      alpha: { command: process.execPath, args: [fixes.server] },
+      beta: { command: process.execPath, args: [fixes.server] },
+    },
+  }), 'utf8')
+  const { session } = makeSession(fixes)
+  await session.sync()
+
+  let writes = 0
+  const original = session.persistCache.bind(session)
+  session.persistCache = (names?: string[]) => {
+    writes += 1
+    return original(names)
+  }
+  await session.refreshCatalog()
+  expect(writes).toBe(1)
+
+  const loaded = loadConfig({ cwd: fixes.project, dshHome: fixes.home })
+  const disk = loadCache(join(loaded.home, 'mcp-cache.json'))
+  expect(Object.keys(disk.servers).sort()).toEqual(['alpha', 'beta'])
+
+  // Q6: a third entry written by "another session" survives this session's next write, and a
+  // purged name is not resurrected from the in-memory snapshot.
+  const other = storeEntry(disk, 'gamma', serverEntry('gamma', { command: process.execPath, args: [fixes.server] }), { tools: [], resources: [], prompts: [], instructions: '' })
+  saveCache(join(loaded.home, 'mcp-cache.json'), disk)
+  expect(other.cachedAt).toBeGreaterThan(0)
+
+  const config = serverEntry('alpha', { command: process.execPath, args: [fixes.server] })
+  storeEntry(session.cache!, 'beta', serverEntry('beta', { command: process.execPath, args: [fixes.server] }), { tools: [], resources: [], prompts: [], instructions: '' })
+  session.persistCache(['beta'])
+  const merged = loadCache(join(loaded.home, 'mcp-cache.json'))
+  expect(Object.keys(merged.servers).sort()).toEqual(['alpha', 'beta', 'gamma'])
+  expect(cachedEntry(merged, 'alpha', config)).toBeDefined()
+
+  // A panel purge removes the name from the session snapshot; the next write must not revive it.
+  session.forgetCachedServer('beta')
+  session.persistCache(['beta'])
+  const afterForget = loadCache(join(loaded.home, 'mcp-cache.json'))
+  expect(afterForget.servers.beta).toBeUndefined()
+  expect(afterForget.servers.gamma).toBeDefined()
+})
+
+it('runs an entry that named a relative cwd inside the session directory', async () => {
+  const fixes = fixture(`
+import { appendFileSync as appendCwdReport } from 'node:fs';
+appendCwdReport(process.argv[2], process.cwd() + '\\n');
+` + SERVER_SOURCE)
+  const report = join(fixes.root, 'cwd.log')
+  const nested = join(fixes.project, 'servers')
+  mkdirSync(nested, { recursive: true })
+
+  // The relative value stays relative in the definition — that is what makes it mean the same thing
+  // in every checkout — and only the pool turns it into a path.
+  const config = serverEntry('demo', { command: process.execPath, args: [fixes.server, report], cwd: './servers' })
+  expect(config.cwd).toBe('./servers')
+
+  const pool = new ServerPool({ home: fixes.home, cwd: () => fixes.project, logger: { debug() {} } })
+  cleanups.push(() => pool.closeAll())
+  await pool.configure([{ config }])
+  await pool.catalog('demo')
+
+  expect(readFileSync(report, 'utf8').trim()).toBe(nested)
 })

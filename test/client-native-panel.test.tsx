@@ -314,3 +314,47 @@ describe('resolveClientCwd', () => {
     expect(resolveClientCwd({ get: () => { throw new Error('no inject') } })).toBe('')
   })
 })
+
+describe('mainSessionCwd reads the live working directory', () => {
+  it('prefers the workingDirectory projection over the creation cwd', () => {
+    // A Session that `cd`-ed: `cwd` is where it was created, `workingDirectory` is where it is now.
+    // Reading `cwd` here would leave the panel managing the checkout the user already left.
+    const ctx = {
+      get: (name: string) => {
+        if (name !== 'sessions') return undefined
+        return {
+          list: {
+            getSnapshot: () => ({
+              ids: ['moved'],
+              byId: {
+                moved: {
+                  cwd: 'D:/work/original',
+                  retainedBy: { mainView: 1 },
+                  projectionValues: { workingDirectory: 'D:/work/current' },
+                },
+              },
+            }),
+          },
+        }
+      },
+    }
+    expect(resolveClientCwd(ctx)).toBe('D:/work/current')
+  })
+
+  it('falls back to the creation cwd when the host projects no working directory', () => {
+    const ctx = {
+      get: (name: string) => {
+        if (name !== 'sessions') return undefined
+        return {
+          list: {
+            getSnapshot: () => ({
+              ids: ['plain'],
+              byId: { plain: { cwd: 'D:/work/original', retainedBy: { mainView: 1 } } },
+            }),
+          },
+        }
+      },
+    }
+    expect(resolveClientCwd(ctx)).toBe('D:/work/original')
+  })
+})

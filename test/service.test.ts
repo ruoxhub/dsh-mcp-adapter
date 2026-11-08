@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { resolveProjectRoot } from '../src/config.ts'
 import { McpServersService } from '../src/service.ts'
 
 describe('McpServersService', () => {
@@ -230,8 +231,9 @@ describe('McpServersService', () => {
       expect(content.mcpServers['old-server']).toBeUndefined()
       expect(content.mcpServers['renamed-server']).toBeDefined()
       expect(content.mcpServers['keep-me']).toBeDefined()
-      expect(evictSpy).toHaveBeenCalledWith('old-server')
-      expect(evictSpy).toHaveBeenCalledWith('renamed-server')
+      // A user-global write names no workspace, so every pool drops the definition.
+      expect(evictSpy).toHaveBeenCalledWith('old-server', undefined)
+      expect(evictSpy).toHaveBeenCalledWith('renamed-server', undefined)
     })
 
     it('migrates a server across scopes, cleaning up the original file and approvals', async () => {
@@ -262,7 +264,8 @@ describe('McpServersService', () => {
 
       const wsContent = JSON.parse(readFileSync(workspaceConfigPath, 'utf8'))
       expect(wsContent.mcpServers['migrating-server']).toBeDefined()
-      expect(evictSpy).toHaveBeenCalledWith('migrating-server')
+      // The write landed in one workspace file, so only that workspace's pools reconnect.
+      expect(evictSpy).toHaveBeenCalledWith('migrating-server', workspaceDir)
     })
   })
 
@@ -287,7 +290,7 @@ describe('McpServersService', () => {
       const content = JSON.parse(readFileSync(userConfigPath, 'utf8'))
       expect(content.mcpServers.keep).toBeDefined()
       expect(content.mcpServers.remove).toBeUndefined()
-      expect(evictSpy).toHaveBeenCalledWith('remove')
+      expect(evictSpy).toHaveBeenCalledWith('remove', undefined)
     })
 
     it('returns ok: true when deleting from non-existent config file', async () => {
@@ -560,5 +563,91 @@ describe('McpServersService workspace enumeration', () => {
         cwd: activeDir,
       })).rejects.toThrow('Unknown preset id')
     })
+  })
+})
+
+describe('McpServersService workspace resolution', () => {
+  let tmpRoot: string
+  let dshHome: string
+  let registered: string
+  let outside: string
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'mcp-service-resolve-'))
+    dshHome = join(tmpRoot, 'dsh-home')
+    registered = join(tmpRoot, 'registered')
+    outside = join(tmpRoot, 'outside')
+    mkdirSync(join(dshHome, 'mcp-adapter'), { recursive: true })
+    mkdirSync(registered, { recursive: true })
+    mkdirSync(outside, { recursive: true })
+  })
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true })
+  })
+
+  it('treats a registered subdirectory as its own workspace, not its .git ancestor', async () => {
+    // A registered workspace that happens to sit inside a git repository: the registry is what DSH
+    // treated as the project, so a `.mcp.json` written from it belongs there — not one level up.
+    mkdirSync(join(tmpRoot, '.git'), { recursive: true })
+    const sub = join(registered, 'packages', 'app')
+    mkdirSync(sub, { recursive: true })
+    const service = new McpServersService({
+      dshHome,
+      workspaces: () => [{ path: sub, title: 'app' }],
+    })
+
+    await service.saveServer({ scope: 'workspace', cwd: sub, name: 'app-server', server: { command: 'node' } })
+
+    expect(existsSync(join(sub, '.mcp.json'))).toBe(true)
+    expect(existsSync(join(tmpRoot, '.mcp.json'))).toBe(false)
+    expect((await service.listServers({ cwd: sub, scope: 'workspace' })).workspaceRoot).toBe(sub)
+  })
+
+  it('refuses a workspace write that names no directory instead of using the host process directory', async () => {
+    const service = new McpServersService({ dshHome })
+
+    // `process.cwd()` here is the package directory — a folder no session selected. Refusing is the
+    // point: writing `.mcp.json` into it would mount a server for whatever session opens it next.
+    await expect(service.saveServer({ scope: 'workspace', name: 'x', server: { command: 'node' } }))
+      .rejects.toMatchObject({ statusCode: 400 })
+    await expect(service.approveServer({ name: 'x' })).rejects.toMatchObject({ statusCode: 400 })
+    await expect(service.deleteServer({ scope: 'workspace', name: 'x' })).rejects.toMatchObject({ statusCode: 400 })
+    // The refusal has to be real: nothing may appear where the old fallback would have written.
+    expect(existsSync(join(process.cwd(), '.mcp.json'))).toBe(false)
+    expect(existsSync(join(tmpRoot, '.mcp.json'))).toBe(false)
+  })
+
+  it('still lists user-global servers when no directory is named', async () => {
+    writeFileSync(
+      join(dshHome, 'mcp-adapter', 'mcp.json'),
+      JSON.stringify({ mcpServers: { 'user-only': { command: 'node' } } }),
+    )
+    const service = new McpServersService({ dshHome })
+
+    const result = await service.listServers({ scope: 'user' })
+
+    expect(result.workspaceRoot).toBe('')
+    expect(result.servers.map((server) => server.name)).toEqual(['user-only'])
+  })
+})
+
+describe('McpServersService and McpSession agree on the workspace identity', () => {
+  it('resolves a registered subdirectory to the registered path on both halves', () => {
+    // The panel writes `.mcp.json` through `resolveTarget`, the session reads it through
+    // `loadConfig({ workspaces })`. If the two rules differed, a server saved from the panel would
+    // never be found by the session that saved it — so this asserts the shared resolver directly.
+    const root = mkdtempSync(join(tmpdir(), 'mcp-adapter-root-'))
+    const registered = join(root, 'repo', 'packages', 'app')
+    const nested = join(registered, 'src')
+    mkdirSync(join(root, 'repo', '.git'), { recursive: true })
+    mkdirSync(nested, { recursive: true })
+    try {
+      expect(resolveProjectRoot(nested, [registered])).toBe(registered)
+      // Without a registry the `.git` rule still applies, which is the headless composition.
+      expect(resolveProjectRoot(nested)).toBe(join(root, 'repo'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })

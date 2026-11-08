@@ -14,6 +14,9 @@ dsh 有两个硬约束，这个插件各补一半：
 | 行为 | 实现 |
 |---|---|
 | 项目级配置 | 读 `$DSH_HOME/mcp-adapter/mcp.json`、`$DSH_HOME/mcp-adapter/mcp-adapter.json`、`<project>/.mcp.json`、`<project>/.dsh/mcp-adapter.json`，后者覆盖前者 |
+| 项目 = 会话当前目录解析出的项目根 | 配置发现用的 `<project>` 是**宿主报告的会话当前目录**（`ctx.workingDirectory`，`working_directory` 工具改的就是它）解析出的**项目根**：落在某个注册工作区内时是那个**注册路径**（仓库子目录也可以是独立工作区），否则是最近的 `.git` 祖先。两者都答不出时会话没有项目，只读用户全局配置。会话 `cd` 进另一个仓库后，下一次 step 会重新加载那边的 `.mcp.json`，面板写的是同一个文件 |
+| 服务器运行目录不属于定义 | stdio 子进程与 `roots/list` 用**会话当前目录**（条目显式写了 `cwd` 时按它解析，相对路径相对会话目录）。这个目录**不进定义哈希**：否则一个全局服务器在每个工作区都有不同的身份，审批记录与目录缓存会互相顶掉。详见 ADR-0009 |
+| 目录缓存只存必要字段 | `mcp-cache.json` 不保存工具的 `outputSchema` 全文（SDK 用自己 `tools/list` 的缓存校验，适配器只需要知道"声明过"）。真实配置从 4,027,351 字节降到约 386,383 字节，`sync()` 的 parse 从约 23ms 降到约 1ms。搜索字段在目录构建时预计算。详见 ADR-0010 |
 | 懒启动 | 配置好不启动；第一次 `mcp({ tool })` 或 `mcp({ connect })` 才连 |
 | 空闲停止 | 默认 10 分钟无调用就停进程（`idleTimeout: 0` 保持到会话结束） |
 | 一个工具代替几百个 | 上下文里只有 `mcp` 一个工具，工具表放在缓存里 |
@@ -26,31 +29,41 @@ dsh 有两个硬约束，这个插件各补一半：
 | 兼容 `autoApprove` | Cursor/Claude Code 那份文件里的 `autoApprove` 直接生效：**列进去的不问，没列的才问**（白名单） |
 | 收养其他 agent 的配置 | `importHosts: ["claude-code","cursor","vscode","codex","shared","agents"]`，优先级低于本插件自己的配置 |
 | keep-alive 重连 | 连接断开后按 0.5s→30s 指数退避自动重连并重读目录 |
+| MCP roots 协议 | 支持 `roots/list` 协议与 capability 宣告，自动映射工作区根路径，支持 `roots: false` 显式 opt-out |
+| 动态请求标头 | HTTP/SSE 服务器支持 `requestHeadersCommand`，每请求执行命令动态生成 Authorization 等 Header |
+| 工具过滤与审批 Glob | `includeTools`、`excludeTools`、`approveTools`、`autoApprove` 支持 `*`、`?` 通配符与 `server_*` 前缀匹配 |
+| 宿主凭证集成 | 自动桥接宿主 `ctx.credentials` 服务，优先解析动态 grant 令牌，无缝回退静态 `bearerToken` |
+| 宿主提问与 Elicitation | 将 MCP `elicitation/create` 转接至宿主 `ctx.userQuestions`；在无交互/无头环境中安全降级拒绝，杜绝死锁；工具调用期间支持计时器挂起 |
 | 会话页头面板 | 一个 MCP 按钮：各服务器状态与工具数、配置问题、被拦服务器的原因；面板内可批准 |
 
 ## 代码结构
 
-宿主侧（Node half，18 个模块）：
+宿主侧（Node half，23 个模块）：
 
 ```
-src/index.ts             插件入口：按 agent 建会话、注册 mcp 工具与命令、空闲清扫、配置热更新
-src/config.ts            配置发现、优先级合并、entry 归一化
-src/trust.ts             项目批准记录（哈希钉死定义）
-src/cache.ts             工具目录缓存
-src/servers.ts           MCP 连接池：懒连接、空闲停止、keep-alive 重连
-src/catalog.ts           命名、include/exclude、搜索排序、describe
-src/proxy.ts             mcp 工具（status/search/describe/instructions/connect/call）
-src/direct.ts            直连工具注册 + 搜索激活
-src/session.ts           单个 agent 的运行时
-src/approval.ts          危险工具审批（映射到 dsh 的 ctx.approval）
-src/prompts.ts           MCP prompts → slash command，参数解析与结果摊平
-src/imports.ts           收养 Cursor/Claude Code/VS Code/Codex 的全局 MCP 文件
-src/testserver.ts        迁移期新增的两个用例驱动的扩展 stdio MCP 服务器（工具/资源/prompt/危险工具）
-src/util.ts              超时、abort 组合、结果投影、输出截断
-src/status.ts            Web 面板的快照（纯函数，可直接测）
-src/projection.ts        Web 面板读的 mcpAdapter 投影 + 发布器
-src/approve.ts           Web 面板「批准」按钮驱动的 mcp_approve 工具
-src/types.ts             跨模块接口（纯声明，不 import 任何模块）
+src/index.ts                  插件入口：按 agent 建会话、注册 mcp 工具与命令、空闲清扫、配置热更新
+src/config.ts                 配置发现、优先级合并、entry 归一化（支持 roots、requestHeadersCommand 等）
+src/trust.ts                  项目批准记录（哈希钉死定义）
+src/cache.ts                  工具目录缓存
+src/servers.ts                MCP 连接池：懒连接、空闲停止、keep-alive 重连、roots 与 elicitation 注册
+src/catalog.ts                命名、include/exclude（Glob/前缀匹配）、搜索排序、describe
+src/proxy.ts                  mcp 工具（status/search/describe/instructions/connect/call）
+src/direct.ts                 直连工具注册 + 搜索激活
+src/session.ts                单个 agent 的运行时（桥接 ctx.credentials 与 ctx.userQuestions）
+src/approval.ts               危险工具审批（映射到 dsh 的 ctx.approval，支持 Glob 匹配）
+src/prompts.ts                MCP prompts → slash command，参数解析与结果摊平
+src/imports.ts                收养 Cursor/Claude Code/VS Code/Codex 的全局 MCP 文件
+src/request-headers-command.ts requestHeadersCommand 动态命令执行与 fetch 请求包装
+src/credentials.ts            宿主 ctx.credentials 令牌解析桥接
+src/elicitation.ts            MCP Elicitation 协议转接 ctx.userQuestions、防死锁回退与超时挂起
+src/testserver.ts             迁移期新增的两个用例驱动的扩展 stdio MCP 服务器（工具/资源/prompt/危险工具）
+src/util.ts                   超时、abort 组合、结果投影、输出截断
+src/status.ts                 Web 面板的快照（纯函数，可直接测）
+src/projection.ts             Web 面板读的 mcpAdapter 投影 + 发布器
+src/approve.ts                Web 面板「批准」按钮驱动的 mcp_approve 工具
+src/routes.ts                面板 REST 路由（每个都过信任围栏）
+src/request-trust.ts         面板路由的浏览器信任围栏（Host / Origin / Sec-Fetch-Site）
+src/types.ts                  跨模块接口（纯声明，不 import 任何模块）
 ```
 
 浏览器侧（client half，4 个文件）：
@@ -70,6 +83,7 @@ src/client/McpPanel.module.css 面板样式（CSS Modules，随 bundle 注入）
 
 会话页头多一个 **MCP** 按钮，点开是一个只读面板。
 
+- **工作区**：面板的 `cwd` 由所在会话的当前目录决定，且必须对得上一个注册工作区（落在注册工作区内的子目录会解析成该工作区）；workspace 作用域的写操作没有可解析目录时直接 400，不会写进宿主的启动目录。列表行优先读会话列表里的 `workingDirectory` 投影，其次才是创建目录。
 - **面板显示什么**：项目根、每个服务器的状态（未启动 / 启动中 / 运行中 / 失败 / 未批准）、工具数（可展开看工具名）、最近错误、配置问题。行上的状态跟着 `projectServers` 走：`allow` 下项目服务器直接报「运行中」，`deny` 下报「未批准」。
 - **批准（仅 `ask` 模式）**：默认 `allow` 下没有「等待批准」这一组，也就没有批准动作。设回 `ask` 后，被信任闸门拦住的服务器会单独列在「等待批准」里，面板给两条路——按「批准」会往当前会话发一条普通消息，模型调用 `mcp_approve` 完成批准（批准留在对话记录里，这也是它该有的样子）；或按「复制命令」拿到 `/mcp-adapter approve <name>` 自己敲。
 - **只读**：面板不能改配置、不能启停服务器、不能删批准记录。刷新目录要连服务器，所以仍然只在命令面（`/mcp-adapter tools`）。
@@ -155,7 +169,7 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 
 ## 验证
 
-`pnpm test` — 20 个测试文件、372 个自检（vitest），其中端到端那组**真的启动一个 stdio MCP 服务器子进程**：
+`pnpm test` — 29 个测试文件、462 个自检（vitest），其中端到端那组**真的启动一个 stdio MCP 服务器子进程**：
 
 - 项目服务器默认直接挂载；`ask` 模式下未批准时**完全不会启动**，批准后第一次取目录才启动，`tools/list` 拿到工具、资源、instructions；
 - 停掉服务器后 `search` / `describe` 仍然工作（缓存）；
@@ -170,7 +184,15 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 - **热缓存调用仍会校验 `outputSchema`**：目录来自磁盘缓存时补一次 `tools/list`，否则首调用静默跳过校验（这条测试经过变异验证：去掉修复它会失败）；
 - **settings 级 `requestTimeoutMs` 真的到达请求**：经 `pickPolicySettings` → 池，1 秒默认让慢服务器失败（同样经过变异验证）；
 - **`protocolVersion: "auto"` 真的上线**：子进程记录到 `server/discover` 探测；
-- **`caFile` 真的改变信任**：自签证书下全局 `fetch` 拒绝、`fetchWithCa` 接受（真实 TLS 握手，非 mock）。
+- **`caFile` 真的改变信任**：自签证书下全局 `fetch` 拒绝、`fetchWithCa` 接受（真实 TLS 握手，非 mock）；
+- **目录就是工作区身份**：会话 `cd` 进另一个 checkout 后 `sync()` 读到那边的 `.mcp.json`、`configChanged()` 为真；
+- **没有目录时不猜**：宿主既不报当前目录也不给创建目录时只加载用户全局配置，不读 `dsh` 进程的启动目录；
+- **workspace 写入必须带目录**：面板 `save`/`approve`/`delete` 缺目录时 400 且磁盘上不产生文件；
+- **服务器目录不参与定义身份**：同一份定义在两个会话目录下连接时缓存条目仍命中，而子进程的 `cwd` 分别落在两个目录（ADR-0009）；
+- **相对 `cwd` 相对会话目录解析**：写 `"./servers"` 的条目实际在该子目录里 spawn，而不是被静默丢弃后在项目根跑；
+- **面板围栏拒绝四种外来请求**：DNS rebinding（外来 `Host`）、`Sec-Fetch-Site: cross-site`、外来 `Origin`、无 `Host`——都返回 403 且不触达 handler。
+- **目录瘦身（ADR-0010）**：一个 600KB 的 `outputSchema` 不会被写进缓存（写入边界就投影成 `hasOutputSchema` 布尔）；构建目录时预计算小写搜索字段，手搓目录惰性派生；
+- **一次冷启动只写一次盘（ADR-0010）**：两台冷服务器不再各写一次全文件；`persistCache` 读-合并-写保留其他会话的条目，被面板 purge 的名字不会被旧快照复活；默认无直连工具时 `mcp({search})` 不再做第二次全量排序。
 
 面板部分（`test/panel.test.ts`、`test/client.test.ts`、`test/client-panel.test.tsx`）：
 
@@ -206,4 +228,4 @@ dsh plugin --profile <name> add link:<repo>/packages/dsh-mcp-adapter
 
 **刻意保留的差异**：`timeoutMs` 与 `transport: "sse"` 只在读取时被接受（*transport alias* —— 非规范拼写，读时兼容、写时永远用规范名），面板写出的永远是 `requestTimeoutMs` / `httpTransport`。
 
-架构决策记在 [docs/adr/](docs/adr/)：0001 是初版权衡（凭据自建、任务不做、静态 preset），0002 记录了宿主能力盘点后把凭据、提问与落盘委托出去，并说明 MCP Tasks 不做是因为 SDK 没有运行时；0003 是变更与驱逐；0004 是对齐 PI-Desktop 的管理架构；0005 是跨作用域迁移与两步武装；0006 是项目信任闸门默认改为 `allow`。
+架构决策记在 [docs/adr/](docs/adr/)：0001 是初版权衡（凭据自建、任务不做、静态 preset），0002 记录了宿主能力盘点后把凭据、提问与落盘委托出去，并说明 MCP Tasks 不做是因为 SDK 没有运行时；0003 是变更与驱逐；0004 是对齐 PI-Desktop 的管理架构；0005 是跨作用域迁移与两步武装；0006 是项目信任闸门默认改为 `allow`；0007 是对齐 PI-Desktop 的 parity 增强；0008 是会话工作区改以宿主当前目录为准；0009 说明服务器运行目录属于会话、不属于定义（含面板信任围栏）；0010 记录目录缓存瘦身与热路径去重（含被否决的共享池 / 自研传输 / 照搬 opencode 清单）。
